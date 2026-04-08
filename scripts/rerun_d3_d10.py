@@ -92,9 +92,6 @@ def main() -> int:
     manifest.metadata["dedupe"] = {"ok": True, "stats": dedupe_stats, "selected_count": len(selected_orig)}
 
     # ── Post-processing ──────────────────────────────────────────────────────
-    selected_orig, selected_rows, dropped_blank = _cli._drop_blank_transition_pages(selected_orig, selected_rows)
-    print(f"  Dropped blank frames: {dropped_blank}")
-
     selected_orig, selected_rows, rescued_gap = _cli._rescue_gap_pages(
         selected_orig=selected_orig,
         selected_rows=selected_rows,
@@ -111,28 +108,19 @@ def main() -> int:
     )
     print(f"  Completed pages: {completed_pages}")
 
-    # Final cleanup: merge adjacent pages satisfying Stage E criteria
-    selected_orig, selected_rows, final_merged = _cli._cleanup_close_pairs(
+    selected_orig, selected_rows, fsm_collapsed, dropped_blank = _cli._postprocess_additive_state_machine(
         selected_orig=selected_orig,
         selected_rows=selected_rows,
     )
-    print(f"  Final cleanup merged: {final_merged}")
-
-    selected_orig, selected_rows, rescued_missing = _cli._rescue_missing_candidate_pages(
-        selected_orig=selected_orig,
-        selected_rows=selected_rows,
-        frame_rows=frame_rows,
-        frames_raw_dir=paths.frames_raw_dir,
-    )
-    print(f"  Rescued missing pages: {rescued_missing}")
+    print(f"  FSM collapsed pages: {fsm_collapsed}")
+    print(f"  Dropped blank frames: {dropped_blank}")
 
     manifest.metadata["dedupe"].update({
         "selected_count": len(selected_orig),
         "dropped_blank_pages": dropped_blank,
         "rescued_gap_pages": rescued_gap,
         "completed_pages": completed_pages,
-        "rescued_missing_pages": rescued_missing,
-        "final_cleanup_merged": final_merged,
+        "fsm_collapsed_pages": fsm_collapsed,
     })
 
     # ── D8 Render ────────────────────────────────────────────────────────────

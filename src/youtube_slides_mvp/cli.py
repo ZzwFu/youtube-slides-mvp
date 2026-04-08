@@ -433,6 +433,90 @@ def _complete_pages(
     return out_orig, out_rows, completed
 
 
+def _postprocess_additive_state_machine(
+    selected_orig: list[Path],
+    selected_rows: list[dict[str, int | float | str]],
+    max_neg: float = 0.0008,
+    min_dark_cover: float = 0.60,
+    max_dark_add: float = 0.35,
+    max_diff: float = 0.10,
+) -> tuple[list[Path], list[dict[str, int | float | str]], int, int]:
+    """Single state-machine postprocess for progressive reveal slides.
+
+    Rule:
+    - walk pages in timeline order
+    - skip blank/transition pages
+    - maintain a current candidate page
+    - if current page differs from candidate by mostly additive change,
+      replace candidate with current page (keep the more complete reveal)
+    - otherwise, finalize candidate and start a new one
+    """
+    if not selected_orig:
+        return selected_orig, selected_rows, 0, 0
+
+    def _load(path: Path) -> np.ndarray:
+        return np.asarray(
+            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
+
+    paired = sorted(zip(selected_orig, selected_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
+
+    # First filter: drop blank transition pages from consideration.
+    valid: list[tuple[Path, dict[str, int | float | str]]] = []
+    dropped_blank = 0
+    for p, r in paired:
+        if _is_blank_transition_frame(p):
+            dropped_blank += 1
+            continue
+        valid.append((p, dict(r)))
+
+    if not valid:
+        return [], [], 0, dropped_blank
+
+    cache: dict[str, np.ndarray] = {}
+
+    def _get(path: Path) -> np.ndarray:
+        if path.name not in cache:
+            cache[path.name] = _load(path)
+        return cache[path.name]
+
+    out: list[tuple[Path, dict[str, int | float | str]]] = []
+    collapsed = 0
+
+    cand_p, cand_r = valid[0]
+    cand_a = _get(cand_p)
+
+    for cur_p, cur_r in valid[1:]:
+        cur_a = _get(cur_p)
+        d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
+        neg, _pos = _directional_change(cand_a, cur_a)
+        dc, da = _dark_cover(cand_a, cur_a)
+
+        additive_only = (
+            d <= max_diff
+            and neg <= max_neg
+            and dc >= min_dark_cover
+            and da <= max_dark_add
+        )
+
+        if additive_only:
+            # Replace with the more complete (later) reveal state.
+            cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
+            collapsed += 1
+        else:
+            out.append((cand_p, cand_r))
+            cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
+
+    out.append((cand_p, cand_r))
+
+    out_orig = [p for p, _ in out]
+    out_rows = [dict(r) for _, r in out]
+    for page, row in enumerate(out_rows, start=1):
+        row["page"] = page
+    return out_orig, out_rows, collapsed, dropped_blank
+
+
 def _rescue_missing_candidate_pages(
     selected_orig: list[Path],
     selected_rows: list[dict[str, int | float | str]],
@@ -836,8 +920,6 @@ def run_pipeline(
                 refill_meta["refill_frames"] = 0
                 refill_meta["refill_rows"] = 0
 
-        selected_orig, selected_rows, dropped_blank = _drop_blank_transition_pages(selected_orig, selected_rows)
-        refill_meta["dropped_blank_pages"] = dropped_blank
         selected_orig, selected_rows, rescued_gap = _rescue_gap_pages(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
@@ -852,21 +934,12 @@ def run_pipeline(
             frames_raw_dir=paths.frames_raw_dir,
         )
         refill_meta["completed_pages"] = completed_pages
-        # Final cleanup: merge any remaining close pairs (from post-processing artifacts)
-        # that should have been merged by Stage E but slipped through due to lookback limits.
-        selected_orig, selected_rows, final_merged = _cleanup_close_pairs(
+        selected_orig, selected_rows, fsm_collapsed, fsm_dropped_blank = _postprocess_additive_state_machine(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
         )
-        refill_meta["final_cleanup_merged"] = final_merged
-        # Run missing-candidate rescue after cleanup so wide gaps are visible.
-        selected_orig, selected_rows, rescued_missing = _rescue_missing_candidate_pages(
-            selected_orig=selected_orig,
-            selected_rows=selected_rows,
-            frame_rows=frame_rows,
-            frames_raw_dir=paths.frames_raw_dir,
-        )
-        refill_meta["rescued_missing_pages"] = rescued_missing
+        refill_meta["fsm_collapsed_pages"] = fsm_collapsed
+        refill_meta["dropped_blank_pages"] = fsm_dropped_blank
         write_ocr_report(ocr_report_path, signals, windows)
         manifest.metadata["ocr"] = {
             "ok": not skip_ocr,
@@ -881,7 +954,7 @@ def run_pipeline(
         manifest.metadata["dedupe"]["dropped_blank_pages"] = int(refill_meta.get("dropped_blank_pages", 0))
         manifest.metadata["dedupe"]["rescued_gap_pages"] = int(refill_meta.get("rescued_gap_pages", 0))
         manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
-        manifest.metadata["dedupe"]["rescued_missing_pages"] = int(refill_meta.get("rescued_missing_pages", 0))
+        manifest.metadata["dedupe"]["fsm_collapsed_pages"] = int(refill_meta.get("fsm_collapsed_pages", 0))
 
         manifest.transition(TaskStatus.RENDERING, "starting D8 rendering")
         write_manifest(manifest, paths.manifest_path)
