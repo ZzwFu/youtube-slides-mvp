@@ -433,24 +433,130 @@ def _complete_pages(
     return out_orig, out_rows, completed
 
 
+def _rescue_missing_candidate_pages(
+    selected_orig: list[Path],
+    selected_rows: list[dict[str, int | float | str]],
+    frame_rows: list[dict[str, int | float | str]],
+    frames_raw_dir: Path,
+    min_gap_sec: float = 18.0,
+    min_diff_to_ends: float = 0.08,
+    min_score: float = 0.03,
+    min_std: float = 12.0,
+) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
+    """Insert one strong missing-page candidate inside wide adjacent gaps.
+
+    Heuristic:
+    - scan non-selected frames between two selected pages when time gap is wide
+    - candidate should differ from both ends (not a near-copy of either side)
+    - choose the candidate with highest separation score
+    """
+    if len(selected_orig) < 2:
+        return selected_orig, selected_rows, 0
+
+    def _load(path: Path) -> np.ndarray:
+        return np.asarray(
+            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
+
+    by_ts = sorted(frame_rows, key=lambda r: float(r.get("timestamp_sec", 0.0)))
+    selected_names = {p.name for p in selected_orig}
+    cache: dict[str, np.ndarray] = {}
+
+    def _load_name(name: str) -> np.ndarray | None:
+        if not name:
+            return None
+        if name not in cache:
+            p = frames_raw_dir / name
+            if not p.exists():
+                return None
+            cache[name] = _load(p)
+        return cache[name]
+
+    inserts: list[tuple[int, Path, dict[str, int | float | str]]] = []
+
+    for i in range(len(selected_rows) - 1):
+        a = selected_rows[i]
+        b = selected_rows[i + 1]
+        ta = float(a.get("timestamp_sec", 0.0))
+        tb = float(b.get("timestamp_sec", 0.0))
+        if tb - ta < min_gap_sec:
+            continue
+
+        an = str(a.get("frame_name", ""))
+        bn = str(b.get("frame_name", ""))
+        aa = _load_name(an)
+        bb = _load_name(bn)
+        if aa is None or bb is None:
+            continue
+        d_ab = float(np.mean(np.abs(aa.astype(np.float32) - bb.astype(np.float32))) / 255.0)
+
+        best: tuple[float, dict[str, int | float | str]] | None = None
+        for row in by_ts:
+            t = float(row.get("timestamp_sec", 0.0))
+            if t <= ta + 1.0 or t >= tb - 1.0:
+                continue
+            name = str(row.get("frame_name", ""))
+            if not name or name in selected_names:
+                continue
+            cc = _load_name(name)
+            if cc is None:
+                continue
+            if float(cc.astype(np.float32).std()) < min_std:
+                continue
+
+            d_ac = float(np.mean(np.abs(aa.astype(np.float32) - cc.astype(np.float32))) / 255.0)
+            d_cb = float(np.mean(np.abs(cc.astype(np.float32) - bb.astype(np.float32))) / 255.0)
+            if d_ac < min_diff_to_ends or d_cb < min_diff_to_ends:
+                continue
+            score = min(d_ac, d_cb) - 0.5 * d_ab
+            if score < min_score:
+                continue
+            if best is None or score > best[0]:
+                best = (score, row)
+
+        if best is not None:
+            row = dict(best[1])
+            cname = str(row.get("frame_name", ""))
+            cpath = frames_raw_dir / cname
+            if cpath.exists():
+                inserts.append((i + 1, cpath, row))
+                selected_names.add(cname)
+
+    if not inserts:
+        return selected_orig, selected_rows, 0
+
+    out_orig = list(selected_orig)
+    out_rows = [dict(r) for r in selected_rows]
+    offset = 0
+    for idx, p, r in inserts:
+        out_orig.insert(idx + offset, p)
+        out_rows.insert(idx + offset, r)
+        offset += 1
+
+    paired = sorted(zip(out_orig, out_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
+    out_orig = [p for p, _ in paired]
+    out_rows = [dict(r) for _, r in paired]
+    for page, row in enumerate(out_rows, start=1):
+        row["page"] = page
+
+    return out_orig, out_rows, len(inserts)
+
+
 def _cleanup_close_pairs(
     selected_orig: list[Path],
     selected_rows: list[dict[str, int | float | str]],
-    diff_th: float = 0.008,
-    dark_cover_th: float = 0.70,
-    dark_add_max: float = 0.25,
+    diff_th: float = 0.012,
+    max_neg: float = 0.002,
+    dark_cover_th: float = 0.94,
+    dark_add_max: float = 0.05,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
     """
-    Post-processing cleanup: merge adjacent pages that satisfy Stage E secondary criteria.
-    This catches duplicate reveals (e.g., progressive reveal pairs) that slipped through
-    dedupe_frames due to lookback window boundaries or post-processing reintroductions.
+    Post-processing cleanup for only near-exact adjacent duplicates.
 
-    Applies two checks:
-    1. Primary (Stage E): Direct pixel-change similarity check (diff < diff_th)
-    2. Secondary (Stage E additive): Dark preservation + minimal new dark pixels
-
-    If adjacent pages satisfy either check, keep the newer (higher-index) page
-    and mark the older one for removal.
+    Gap rescue and completion can reintroduce a few almost-identical neighbors.
+    Keep this pass intentionally strict so we do not collapse legitimate
+    progressive-reveal pages and undercount the final deck.
     """
     if len(selected_orig) < 2:
         return selected_orig, selected_rows, 0
@@ -464,14 +570,9 @@ def _cleanup_close_pairs(
     cache: dict[str, np.ndarray] = {}
     to_remove: set[int] = set()
     merged = 0
-    debug_candidates: list[tuple[int, int, float, float, float]] = []
 
     i = 0
     while i < len(selected_orig) - 1:
-        if i in to_remove:
-            i += 1
-            continue
-
         path_curr = selected_orig[i]
         path_next = selected_orig[i + 1]
 
@@ -486,24 +587,14 @@ def _cleanup_close_pairs(
         # Check Stage E primary: direct pixel-change similarity.
         d = float(np.mean(np.abs(arr_curr.astype(np.float32) - arr_next.astype(np.float32))) / 255.0)
 
-        should_merge = False
-        dc, da = 0.0, 0.0
-        if d < diff_th:
-            should_merge = True
-        else:
-            # Check Stage E secondary: dark preservation + minimal additive dark.
-            dc, da = _dark_cover(arr_curr, arr_next)
-            if dc >= dark_cover_th and da <= dark_add_max:
-                should_merge = True
-
-        # Record candidate for debugging
-        debug_candidates.append((i, i + 1, d, dc, da))
+        neg, _pos = _directional_change(arr_curr, arr_next)
+        dc, da = _dark_cover(arr_curr, arr_next)
+        should_merge = d <= diff_th and neg <= max_neg and dc >= dark_cover_th and da <= dark_add_max
 
         if should_merge:
             # Mark the current (older) page for removal; keep the next.
             to_remove.add(i)
             merged += 1
-            print(f"  [cleanup] merge p{i+1}/p{i+2}: d={d:.6f}, dc={dc:.4f}, da={da:.4f}")
             # Skip over the next page too; continue with the page after.
             i += 2
         else:
@@ -516,11 +607,6 @@ def _cleanup_close_pairs(
     # Reindex page numbers.
     for page, row in enumerate(new_rows, start=1):
         row["page"] = page
-
-    if merged > 0:
-        print(f"[cleanup] total merged: {merged} pairs from {len(selected_orig)} pages → {len(new_orig)} pages")
-    else:
-        print(f"[cleanup] no pairs merged (checked {len(debug_candidates)} adjacent pairs)")
 
     return new_orig, new_rows, merged
 
@@ -773,6 +859,14 @@ def run_pipeline(
             selected_rows=selected_rows,
         )
         refill_meta["final_cleanup_merged"] = final_merged
+        # Run missing-candidate rescue after cleanup so wide gaps are visible.
+        selected_orig, selected_rows, rescued_missing = _rescue_missing_candidate_pages(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+            frame_rows=frame_rows,
+            frames_raw_dir=paths.frames_raw_dir,
+        )
+        refill_meta["rescued_missing_pages"] = rescued_missing
         write_ocr_report(ocr_report_path, signals, windows)
         manifest.metadata["ocr"] = {
             "ok": not skip_ocr,
@@ -787,6 +881,7 @@ def run_pipeline(
         manifest.metadata["dedupe"]["dropped_blank_pages"] = int(refill_meta.get("dropped_blank_pages", 0))
         manifest.metadata["dedupe"]["rescued_gap_pages"] = int(refill_meta.get("rescued_gap_pages", 0))
         manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
+        manifest.metadata["dedupe"]["rescued_missing_pages"] = int(refill_meta.get("rescued_missing_pages", 0))
 
         manifest.transition(TaskStatus.RENDERING, "starting D8 rendering")
         write_manifest(manifest, paths.manifest_path)

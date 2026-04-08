@@ -118,11 +118,20 @@ def main() -> int:
     )
     print(f"  Final cleanup merged: {final_merged}")
 
+    selected_orig, selected_rows, rescued_missing = _cli._rescue_missing_candidate_pages(
+        selected_orig=selected_orig,
+        selected_rows=selected_rows,
+        frame_rows=frame_rows,
+        frames_raw_dir=paths.frames_raw_dir,
+    )
+    print(f"  Rescued missing pages: {rescued_missing}")
+
     manifest.metadata["dedupe"].update({
         "selected_count": len(selected_orig),
         "dropped_blank_pages": dropped_blank,
         "rescued_gap_pages": rescued_gap,
         "completed_pages": completed_pages,
+        "rescued_missing_pages": rescued_missing,
         "final_cleanup_merged": final_merged,
     })
 
