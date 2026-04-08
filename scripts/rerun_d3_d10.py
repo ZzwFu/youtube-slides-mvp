@@ -1,6 +1,6 @@
 """
 Reuse extracted frames from a previous run and execute D3-D10 directly.
-Usage: python scripts/rerun_d3_d10.py [source_run_id]
+Usage: python scripts/rerun_d3_d10.py [source_run_id] [complete_mode]
 """
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ URL = "http://youtube.com/watch?v=9eqDWJSvCx4"
 
 def main() -> int:
     src_id = sys.argv[1] if len(sys.argv) > 1 else "slide-20260408-034253"
+    complete_mode = sys.argv[2] if len(sys.argv) > 2 else "iterative"
+    if complete_mode not in {"iterative", "single-pass"}:
+        print(f"ERROR: complete_mode must be iterative or single-pass, got: {complete_mode}")
+        return 2
     src_run = RUNS_DIR / src_id
     src_frames = src_run / "frames_raw"
     src_manifest = src_run / "artifacts" / "frame_manifest.json"
@@ -105,8 +109,9 @@ def main() -> int:
         selected_rows=selected_rows,
         frame_rows=frame_rows,
         frames_raw_dir=paths.frames_raw_dir,
+        mode=complete_mode,
     )
-    print(f"  Completed pages: {completed_pages}")
+    print(f"  Completed pages: {completed_pages}  mode={complete_mode}")
 
     selected_orig, selected_rows, fsm_collapsed, dropped_blank = _cli._postprocess_additive_state_machine(
         selected_orig=selected_orig,
@@ -126,6 +131,7 @@ def main() -> int:
         "dropped_blank_pages": dropped_blank,
         "rescued_gap_pages": rescued_gap,
         "completed_pages": completed_pages,
+        "complete_mode": complete_mode,
         "fsm_collapsed_pages": fsm_collapsed,
         "merged_close_pairs": merged_close_pairs,
     })

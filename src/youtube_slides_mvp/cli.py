@@ -333,6 +333,7 @@ def _complete_pages(
     selected_rows: list[dict[str, int | float | str]],
     frame_rows: list[dict[str, int | float | str]],
     frames_raw_dir: Path,
+    mode: str = "iterative",
     lookahead_sec: float = 30.0,
     dark_cover_th: float = 0.75,
     max_neg: float = 0.012,
@@ -384,6 +385,7 @@ def _complete_pages(
         local_used: set[str] = {current_path.name}
 
         # Iteratively advance within this page's own completion window.
+        # In single-pass mode, run this loop at most once for A/B comparison.
         while True:
             t_current = float(current_row.get("timestamp_sec", 0.0))
             if current_path.name not in cache:
@@ -432,6 +434,9 @@ def _complete_pages(
             current_row = best_row
             local_used.add(current_path.name)
             changed = True
+
+            if mode == "single-pass":
+                break
 
         if changed:
             out_orig[i] = current_path
@@ -723,6 +728,7 @@ def run_pipeline(
     refill_multiplier: float,
     max_refill_windows: int,
     refill_window_cap_sec: float,
+    complete_mode: str,
 ) -> int:
     if not url.startswith("http"):
         print("ERROR: --url must be a valid http(s) URL")
@@ -947,8 +953,10 @@ def run_pipeline(
             selected_rows=selected_rows,
             frame_rows=frame_rows,
             frames_raw_dir=paths.frames_raw_dir,
+            mode=complete_mode,
         )
         refill_meta["completed_pages"] = completed_pages
+        refill_meta["complete_mode"] = complete_mode
         selected_orig, selected_rows, fsm_collapsed, fsm_dropped_blank = _postprocess_additive_state_machine(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
@@ -974,6 +982,7 @@ def run_pipeline(
         manifest.metadata["dedupe"]["dropped_blank_pages"] = int(refill_meta.get("dropped_blank_pages", 0))
         manifest.metadata["dedupe"]["rescued_gap_pages"] = int(refill_meta.get("rescued_gap_pages", 0))
         manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
+        manifest.metadata["dedupe"]["complete_mode"] = str(refill_meta.get("complete_mode", "iterative"))
         manifest.metadata["dedupe"]["fsm_collapsed_pages"] = int(refill_meta.get("fsm_collapsed_pages", 0))
         manifest.metadata["dedupe"]["merged_close_pairs"] = int(refill_meta.get("merged_close_pairs", 0))
 
@@ -1045,6 +1054,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--refill-multiplier", type=float, default=2.5, help="D7 refill fps multiplier")
     run_cmd.add_argument("--max-refill-windows", type=int, default=3, help="max suspect windows to refill")
     run_cmd.add_argument("--refill-window-cap-sec", type=float, default=60.0, help="max seconds per refill window")
+    run_cmd.add_argument(
+        "--complete-mode",
+        choices=["iterative", "single-pass"],
+        default="iterative",
+        help="page completion strategy for A/B comparison",
+    )
 
     sub.add_parser("healthcheck", help="print tool versions")
     return parser
@@ -1070,6 +1085,7 @@ def main() -> int:
             refill_multiplier=float(args.refill_multiplier),
             max_refill_windows=int(args.max_refill_windows),
             refill_window_cap_sec=float(args.refill_window_cap_sec),
+            complete_mode=str(args.complete_mode),
         )
 
     parser.print_help()
