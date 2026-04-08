@@ -357,77 +357,86 @@ def _complete_pages(
             dtype=np.uint8,
         )
 
-    by_name: dict[str, dict[str, int | float | str]] = {str(r["frame_name"]): r for r in frame_rows}
-    selected_set = {p.name for p in selected_orig}
     cache: dict[str, np.ndarray] = {}
+    # Freeze original neighbors so one page's replacement does not affect
+    # another page's completion window.
+    base_orig = list(selected_orig)
+    base_rows = [dict(r) for r in selected_rows]
 
     out_orig = list(selected_orig)
     out_rows = [dict(r) for r in selected_rows]
     completed = 0
 
-    for i, (page_path, page_row) in enumerate(zip(out_orig, out_rows)):
-        t_page = float(page_row.get("timestamp_sec", 0.0))
+    for i, (page_path, page_row) in enumerate(zip(base_orig, base_rows)):
+        t_base = float(page_row.get("timestamp_sec", 0.0))
         # Upper bound: midpoint to next selected page, or lookahead, whichever is smaller.
-        if i + 1 < len(out_rows):
-            t_next = float(out_rows[i + 1].get("timestamp_sec", t_page + lookahead_sec * 2))
-            t_limit = min(t_page + lookahead_sec, (t_page + t_next) / 2)
+        if i + 1 < len(base_rows):
+            t_next = float(base_rows[i + 1].get("timestamp_sec", t_base + lookahead_sec * 2))
+            t_limit = min(t_base + lookahead_sec, (t_base + t_next) / 2)
         else:
-            t_limit = t_page + lookahead_sec
-        if t_limit <= t_page + 1.0:
+            t_limit = t_base + lookahead_sec
+        if t_limit <= t_base + 1.0:
             continue  # pages too close, nothing to look ahead
 
-        # Load current page array.
-        if page_path.name not in cache:
-            cache[page_path.name] = _load(page_path)
-        a_page = cache[page_path.name]
+        current_path = page_path
+        current_row = dict(page_row)
+        changed = False
+        local_used: set[str] = {current_path.name}
 
-        # Scan frames in (t_page, t_limit] that are NOT already selected.
-        candidates = [
-            r for r in frame_rows
-            if t_page + 1.0 < float(r.get("timestamp_sec", 0.0)) <= t_limit
-            and str(r.get("frame_name", "")) not in selected_set
-        ]
-        if not candidates:
-            continue
+        # Iteratively advance within this page's own completion window.
+        while True:
+            t_current = float(current_row.get("timestamp_sec", 0.0))
+            if current_path.name not in cache:
+                cache[current_path.name] = _load(current_path)
+            a_page = cache[current_path.name]
 
-        best_path: Path | None = None
-        best_diff = -1.0
-        best_row: dict[str, int | float | str] | None = None
+            candidates = [
+                r for r in frame_rows
+                if t_current + 1.0 < float(r.get("timestamp_sec", 0.0)) <= t_limit
+            ]
+            if not candidates:
+                break
 
-        for row in candidates:
-            cname = str(row.get("frame_name", ""))
-            if not cname:
-                continue
-            cpath = frames_raw_dir / cname
-            if not cpath.exists() or _is_blank_transition_frame(cpath):
-                continue
-            if cname not in cache:
-                cache[cname] = _load(cpath)
-            arr = cache[cname]
-            d = float(np.mean(np.abs(a_page.astype(np.float32) - arr.astype(np.float32))) / 255.0)
-            if d < min_diff or d > max_diff:
-                continue
-            neg, _pos = _directional_change(a_page, arr)
-            if neg > max_neg:
-                continue
-            dc, _da = _dark_cover(a_page, arr)
-            if dc < dark_cover_th:
-                continue
-            # Among valid candidates, prefer the one with the highest diff
-            # (most content added while still preserving the current page).
-            if d > best_diff:
-                best_diff = d
-                best_path = cpath
-                best_row = dict(row)
+            best_path: Path | None = None
+            best_diff = -1.0
+            best_row: dict[str, int | float | str] | None = None
 
-        if best_path is not None and best_row is not None:
-            old_name = out_orig[i].name
-            out_orig[i] = best_path
-            out_rows[i] = best_row
+            for row in candidates:
+                cname = str(row.get("frame_name", ""))
+                if not cname or cname in local_used:
+                    continue
+                cpath = frames_raw_dir / cname
+                if not cpath.exists() or _is_blank_transition_frame(cpath):
+                    continue
+                if cname not in cache:
+                    cache[cname] = _load(cpath)
+                arr = cache[cname]
+                d = float(np.mean(np.abs(a_page.astype(np.float32) - arr.astype(np.float32))) / 255.0)
+                if d < min_diff or d > max_diff:
+                    continue
+                neg, _pos = _directional_change(a_page, arr)
+                if neg > max_neg:
+                    continue
+                dc, _da = _dark_cover(a_page, arr)
+                if dc < dark_cover_th:
+                    continue
+                if d > best_diff:
+                    best_diff = d
+                    best_path = cpath
+                    best_row = dict(row)
+
+            if best_path is None or best_row is None:
+                break
+
+            current_path = best_path
+            current_row = best_row
+            local_used.add(current_path.name)
+            changed = True
+
+        if changed:
+            out_orig[i] = current_path
+            out_rows[i] = current_row
             out_rows[i]["page"] = page_row["page"]
-            # Update the selected set so rescued frames stay consistent.
-            selected_set.discard(old_name)
-            selected_set.add(best_path.name)
             completed += 1
 
     return out_orig, out_rows, completed
@@ -634,6 +643,9 @@ def _cleanup_close_pairs(
     max_neg: float = 0.002,
     dark_cover_th: float = 0.94,
     dark_add_max: float = 0.05,
+    tiny_diff_th: float = 0.003,
+    tiny_max_neg: float = 0.001,
+    tiny_max_dt: float = 8.0,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
     """
     Post-processing cleanup for only near-exact adjacent duplicates.
@@ -673,7 +685,10 @@ def _cleanup_close_pairs(
 
         neg, _pos = _directional_change(arr_curr, arr_next)
         dc, da = _dark_cover(arr_curr, arr_next)
-        should_merge = d <= diff_th and neg <= max_neg and dc >= dark_cover_th and da <= dark_add_max
+        dt = float(selected_rows[i + 1].get("timestamp_sec", 0.0)) - float(selected_rows[i].get("timestamp_sec", 0.0))
+        strict_near_exact = d <= diff_th and neg <= max_neg and dc >= dark_cover_th and da <= dark_add_max
+        tiny_near_exact = d <= tiny_diff_th and neg <= tiny_max_neg and dt <= tiny_max_dt
+        should_merge = strict_near_exact or tiny_near_exact
 
         if should_merge:
             # Mark the current (older) page for removal; keep the next.
@@ -940,6 +955,11 @@ def run_pipeline(
         )
         refill_meta["fsm_collapsed_pages"] = fsm_collapsed
         refill_meta["dropped_blank_pages"] = fsm_dropped_blank
+        selected_orig, selected_rows, merged_close_pairs = _cleanup_close_pairs(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+        )
+        refill_meta["merged_close_pairs"] = merged_close_pairs
         write_ocr_report(ocr_report_path, signals, windows)
         manifest.metadata["ocr"] = {
             "ok": not skip_ocr,
@@ -955,6 +975,7 @@ def run_pipeline(
         manifest.metadata["dedupe"]["rescued_gap_pages"] = int(refill_meta.get("rescued_gap_pages", 0))
         manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
         manifest.metadata["dedupe"]["fsm_collapsed_pages"] = int(refill_meta.get("fsm_collapsed_pages", 0))
+        manifest.metadata["dedupe"]["merged_close_pairs"] = int(refill_meta.get("merged_close_pairs", 0))
 
         manifest.transition(TaskStatus.RENDERING, "starting D8 rendering")
         write_manifest(manifest, paths.manifest_path)

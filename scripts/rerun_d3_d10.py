@@ -115,12 +115,19 @@ def main() -> int:
     print(f"  FSM collapsed pages: {fsm_collapsed}")
     print(f"  Dropped blank frames: {dropped_blank}")
 
+    selected_orig, selected_rows, merged_close_pairs = _cli._cleanup_close_pairs(
+        selected_orig=selected_orig,
+        selected_rows=selected_rows,
+    )
+    print(f"  Merged close pairs: {merged_close_pairs}")
+
     manifest.metadata["dedupe"].update({
         "selected_count": len(selected_orig),
         "dropped_blank_pages": dropped_blank,
         "rescued_gap_pages": rescued_gap,
         "completed_pages": completed_pages,
         "fsm_collapsed_pages": fsm_collapsed,
+        "merged_close_pairs": merged_close_pairs,
     })
 
     # ── D8 Render ────────────────────────────────────────────────────────────
