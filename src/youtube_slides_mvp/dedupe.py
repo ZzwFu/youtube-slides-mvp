@@ -26,6 +26,14 @@ class DedupeConfig:
     chain_step_th: float = 0.060
     chain_anchor_max: float = 0.15
     chain_direction_ratio: float = 0.72
+    # Stage G: motion-ratio stable-segment collapse.
+    # Walk Stage-F output and track runs of consecutive frame-pairs whose
+    # "motion ratio" (fraction of pixels with |diff| > motion_th) stays
+    # below motion_ratio_th. Only the tail (most-settled) frame of each run
+    # that is long enough (>= min_stable_frames) is kept.
+    motion_th: float = 15.0        # pixel-diff to count a pixel as "moving"
+    motion_ratio_th: float = 0.025 # fraction below which a pair is "stable"
+    min_stable_frames: int = 3     # minimum run length to trigger collapse
 
 
 def _load_gray(path: Path, size: tuple[int, int] = (256, 144)) -> np.ndarray:
@@ -67,6 +75,11 @@ def _directional_change(prev: np.ndarray, curr: np.ndarray) -> tuple[float, floa
     neg = float(np.mean(np.clip(-delta, 0, None)) / 255.0)
     pos = float(np.mean(np.clip(delta, 0, None)) / 255.0)
     return neg, pos
+
+
+def _motion_ratio(a: np.ndarray, b: np.ndarray, motion_th: float = 15.0) -> float:
+    """Fraction of pixels where |a - b| exceeds motion_th."""
+    return float((np.abs(a.astype(np.float32) - b.astype(np.float32)) > motion_th).mean())
 
 
 def _sorted_unique(idx: list[int]) -> list[int]:
@@ -203,5 +216,36 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
     f_idx = _sorted_unique(f_idx)
 
     stats["after_f"] = len(f_idx)
-    selected = [paths[i] for i in f_idx]
+
+    # Stage G: motion-ratio stable-segment collapse.
+    # Walk Stage-F output and identify runs of consecutive frame-pairs that
+    # have very little pixel motion (slide is still settling / progressive
+    # reveal finishing). Keep only the tail (most-complete) frame of each
+    # run long enough to be a genuine reveal sequence.
+    if len(f_idx) < 2:
+        g_idx: list[int] = list(f_idx)
+    else:
+        g_run: list[int] = [f_idx[0]]
+        g_idx = []
+        for i in f_idx[1:]:
+            j = g_run[-1]
+            mr = _motion_ratio(arrays[j], arrays[i], cfg.motion_th)
+            if mr < cfg.motion_ratio_th:
+                g_run.append(i)       # extend stable run
+            else:
+                # motion spike: commit the current stable run
+                if len(g_run) >= cfg.min_stable_frames:
+                    g_idx.append(g_run[-1])  # keep tail (most settled)
+                else:
+                    g_idx.extend(g_run)       # short run: keep all
+                g_run = [i]           # new run starts with trigger frame
+        # commit the final run
+        if len(g_run) >= cfg.min_stable_frames:
+            g_idx.append(g_run[-1])
+        else:
+            g_idx.extend(g_run)
+        g_idx = _sorted_unique(g_idx)
+
+    stats["after_g"] = len(g_idx)
+    selected = [paths[i] for i in g_idx]
     return selected, stats
