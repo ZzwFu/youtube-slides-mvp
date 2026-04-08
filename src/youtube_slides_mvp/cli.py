@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .dedupe import DedupeConfig, dedupe_frames
+from .dedupe import DedupeConfig, _dark_cover, _directional_change, _load_gray, dedupe_frames
 from .extract import build_frame_rows, find_downloaded_video, write_frame_manifest
 from .health import run_healthcheck
 from .manifest import build_task_paths, ensure_task_dirs, make_task_id, write_manifest
@@ -328,6 +328,111 @@ def _rescue_gap_pages(
     return out_orig, out_rows, total_inserted
 
 
+def _complete_pages(
+    selected_orig: list[Path],
+    selected_rows: list[dict[str, int | float | str]],
+    frame_rows: list[dict[str, int | float | str]],
+    frames_raw_dir: Path,
+    lookahead_sec: float = 30.0,
+    dark_cover_th: float = 0.75,
+    max_neg: float = 0.012,
+    min_diff: float = 0.008,
+    max_diff: float = 0.15,
+) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
+    """Replace each selected page with its most-complete reveal state.
+
+    Looks up to *lookahead_sec* seconds ahead of each selected page for a
+    frame that preserves existing dark content (dark_cover >= dark_cover_th)
+    while being *more* complete (additive-only change, diff in [min_diff, max_diff]).
+    Replaces the current page with the most-complete such frame found.
+    Bounded by the midpoint to the next selected page so we never steal
+    a frame that belongs to the next slide.
+    """
+    if not selected_orig:
+        return selected_orig, selected_rows, 0
+
+    def _load(path: Path) -> np.ndarray:
+        return np.asarray(
+            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
+
+    by_name: dict[str, dict[str, int | float | str]] = {str(r["frame_name"]): r for r in frame_rows}
+    selected_set = {p.name for p in selected_orig}
+    cache: dict[str, np.ndarray] = {}
+
+    out_orig = list(selected_orig)
+    out_rows = [dict(r) for r in selected_rows]
+    completed = 0
+
+    for i, (page_path, page_row) in enumerate(zip(out_orig, out_rows)):
+        t_page = float(page_row.get("timestamp_sec", 0.0))
+        # Upper bound: midpoint to next selected page, or lookahead, whichever is smaller.
+        if i + 1 < len(out_rows):
+            t_next = float(out_rows[i + 1].get("timestamp_sec", t_page + lookahead_sec * 2))
+            t_limit = min(t_page + lookahead_sec, (t_page + t_next) / 2)
+        else:
+            t_limit = t_page + lookahead_sec
+        if t_limit <= t_page + 1.0:
+            continue  # pages too close, nothing to look ahead
+
+        # Load current page array.
+        if page_path.name not in cache:
+            cache[page_path.name] = _load(page_path)
+        a_page = cache[page_path.name]
+
+        # Scan frames in (t_page, t_limit] that are NOT already selected.
+        candidates = [
+            r for r in frame_rows
+            if t_page + 1.0 < float(r.get("timestamp_sec", 0.0)) <= t_limit
+            and str(r.get("frame_name", "")) not in selected_set
+        ]
+        if not candidates:
+            continue
+
+        best_path: Path | None = None
+        best_diff = -1.0
+        best_row: dict[str, int | float | str] | None = None
+
+        for row in candidates:
+            cname = str(row.get("frame_name", ""))
+            if not cname:
+                continue
+            cpath = frames_raw_dir / cname
+            if not cpath.exists() or _is_blank_transition_frame(cpath):
+                continue
+            if cname not in cache:
+                cache[cname] = _load(cpath)
+            arr = cache[cname]
+            d = float(np.mean(np.abs(a_page.astype(np.float32) - arr.astype(np.float32))) / 255.0)
+            if d < min_diff or d > max_diff:
+                continue
+            neg, _pos = _directional_change(a_page, arr)
+            if neg > max_neg:
+                continue
+            dc, _da = _dark_cover(a_page, arr)
+            if dc < dark_cover_th:
+                continue
+            # Among valid candidates, prefer the one with the highest diff
+            # (most content added while still preserving the current page).
+            if d > best_diff:
+                best_diff = d
+                best_path = cpath
+                best_row = dict(row)
+
+        if best_path is not None and best_row is not None:
+            old_name = out_orig[i].name
+            out_orig[i] = best_path
+            out_rows[i] = best_row
+            out_rows[i]["page"] = page_row["page"]
+            # Update the selected set so rescued frames stay consistent.
+            selected_set.discard(old_name)
+            selected_set.add(best_path.name)
+            completed += 1
+
+    return out_orig, out_rows, completed
+
+
 def run_pipeline(
     url: str,
     outdir: Path,
@@ -562,6 +667,13 @@ def run_pipeline(
             frames_raw_dir=paths.frames_raw_dir,
         )
         refill_meta["rescued_gap_pages"] = rescued_gap
+        selected_orig, selected_rows, completed_pages = _complete_pages(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+            frame_rows=frame_rows,
+            frames_raw_dir=paths.frames_raw_dir,
+        )
+        refill_meta["completed_pages"] = completed_pages
 
         write_ocr_report(ocr_report_path, signals, windows)
         manifest.metadata["ocr"] = {
@@ -576,6 +688,7 @@ def run_pipeline(
         manifest.metadata["dedupe"]["selected_count"] = len(selected_orig)
         manifest.metadata["dedupe"]["dropped_blank_pages"] = int(refill_meta.get("dropped_blank_pages", 0))
         manifest.metadata["dedupe"]["rescued_gap_pages"] = int(refill_meta.get("rescued_gap_pages", 0))
+        manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
 
         manifest.transition(TaskStatus.RENDERING, "starting D8 rendering")
         write_manifest(manifest, paths.manifest_path)

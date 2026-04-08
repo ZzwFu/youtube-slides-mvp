@@ -14,11 +14,22 @@ class DedupeConfig:
     reveal_cover_th: float = 0.92
     reveal_add_th: float = 0.18
     transition_mid_th: float = 0.09
+    # Stage C: a "midpoint" cannot be classified as a transition if it was
+    # held for this many or more original frames in Stage A (i.e. it represents
+    # real content, not a brief flash between two dark frames).
+    transition_min_hold: int = 3
     progressive_lookback: int = 20
     progressive_diff_th: float = 0.06
     progressive_hash_th: int = 10
     progressive_cover_th: float = 0.95
     progressive_add_th: float = 0.24
+    # Stage E secondary: "additive progressive reveal" on light-background slides.
+    # Fires when the primary bright-pixel coverage check misses pairs where new
+    # content was added as bright pixels (neg ≈ 0, pos >> 0, dark text preserved).
+    additive_reveal_diff_th: float = 0.12
+    additive_neg_max: float = 0.025
+    additive_dark_cover_th: float = 0.70
+    additive_dark_add_th: float = 0.25
     # Stage F: chain-based progressive-reveal collapse.
     # Frames are merged into a chain as long as each step diff is small AND
     # the total drift from the chain anchor stays below chain_anchor_max.
@@ -82,6 +93,23 @@ def _motion_ratio(a: np.ndarray, b: np.ndarray, motion_th: float = 15.0) -> floa
     return float((np.abs(a.astype(np.float32) - b.astype(np.float32)) > motion_th).mean())
 
 
+def _dark_cover(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    """Dark-pixel coverage: fraction of a's text/dark content preserved in b, and fraction new.
+
+    For light-background slides, dark pixels represent text.  A high cover with
+    low add means b is a progressive-reveal superset of a.
+    """
+    pm = a <= np.percentile(a, 30)
+    cm = b <= np.percentile(b, 30)
+    pn = int(pm.sum())
+    cn = int(cm.sum())
+    if pn == 0 or cn == 0:
+        return 0.0, 1.0
+    inter = int(np.logical_and(pm, cm).sum())
+    new   = int(np.logical_and(~pm, cm).sum())
+    return inter / float(pn), new / float(cn)
+
+
 def _sorted_unique(idx: list[int]) -> list[int]:
     if not idx:
         return []
@@ -115,15 +143,23 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
             keep_idx.append(i)
 
     # Stage C: drop transition midpoint if previous and next are close but current differs strongly.
+    # Guard: if this Stage-A slot represents >= transition_min_hold original frames the content
+    # was held long enough to be real — don't classify it as a brief transition midpoint.
     c_idx = [keep_idx[0]]
     for k in range(1, len(keep_idx) - 1):
         p = keep_idx[k - 1]
         c = keep_idx[k]
         n = keep_idx[k + 1]
+        hold = c - p  # number of original frames collapsed into this Stage-A slot
         d_pc = _diff(arrays[p], arrays[c])
         d_cn = _diff(arrays[c], arrays[n])
         d_pn = _diff(arrays[p], arrays[n])
-        is_mid = d_pc > cfg.transition_mid_th and d_cn > cfg.transition_mid_th and d_pn < cfg.adjacent_diff_th
+        is_mid = (
+            hold < cfg.transition_min_hold
+            and d_pc > cfg.transition_mid_th
+            and d_cn > cfg.transition_mid_th
+            and d_pn < cfg.adjacent_diff_th
+        )
         if not is_mid:
             c_idx.append(c)
     if len(keep_idx) > 1:
@@ -141,6 +177,9 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
             out_idx.append(i)
 
     # Stage E: lookback progressive merge for repeated reveal-like pages.
+    # Primary check: bright-pixel coverage (works for dark-bg + light-text slides).
+    # Secondary check: additive-reveal detection for light-bg + dark-text slides where
+    # new content appears as bright pixels (neg ≈ 0, pos >> 0, dark text preserved).
     e_idx: list[int] = []
     for i in out_idx:
         merged = False
@@ -149,12 +188,24 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
             d = _diff(arrays[j], arrays[i])
             hd = _hamming(hashes[j], hashes[i])
             cover, add = _reveal(arrays[j], arrays[i])
-            if (
+            primary = (
                 d <= cfg.progressive_diff_th
                 and hd <= cfg.progressive_hash_th
                 and cover >= cfg.progressive_cover_th
                 and add <= cfg.progressive_add_th
-            ):
+            )
+            if not primary:
+                neg, pos = _directional_change(arrays[j], arrays[i])
+                dc, da = _dark_cover(arrays[j], arrays[i])
+                secondary = (
+                    d <= cfg.additive_reveal_diff_th
+                    and neg <= cfg.additive_neg_max
+                    and dc >= cfg.additive_dark_cover_th
+                    and da <= cfg.additive_dark_add_th
+                )
+            else:
+                secondary = False
+            if primary or secondary:
                 e_idx[back] = i
                 merged = True
                 break

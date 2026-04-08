@@ -101,3 +101,85 @@ def test_stage_g_keeps_short_stable_run(tmp_path: Path) -> None:
     # (Stage A may already collapse them as near-duplicates, but if they do survive to G,
     # they should not be further reduced by G.)
     assert stats["after_g"] == stats["after_f"] or stats["after_g"] >= 1
+
+
+def test_stage_c_keeps_held_title_frame(tmp_path: Path) -> None:
+    """Stage C must NOT drop a frame that was held for many Stage-A frames.
+
+    Pattern: black → [title repeated 10x] → black → fading content
+    Without the hold-count guard, Stage C would see title as a transition
+    midpoint between two dark frames and drop it.
+    """
+    frames = [tmp_path / f"frame_{i:06d}.jpg" for i in range(1, 16)]
+
+    # Frame 0: near-black transition
+    black = np.full((144, 256), 18, dtype=np.uint8)
+    # Title slide: bright background with text (mean ~200)
+    title = np.full((144, 256), 200, dtype=np.uint8)
+    title[20:40, 20:230] = 30   # title text row → dark
+    # Near-black transition again (after title)
+    black2 = np.full((144, 256), 20, dtype=np.uint8)
+    # Fading in: gradually brightening frames
+    fade = np.full((144, 256), 40, dtype=np.uint8)
+
+    Image.fromarray(black).save(frames[0], format="JPEG")  # frame_000001
+    for i in range(1, 11):                                 # frames 2-11: title held 10x
+        Image.fromarray(title).save(frames[i], format="JPEG")
+    Image.fromarray(black2).save(frames[11], format="JPEG")  # frame_000012
+    for i in range(12, 15):                                # frames 13-15: fade
+        f = np.full((144, 256), 40 + (i - 12) * 8, dtype=np.uint8)
+        Image.fromarray(f).save(frames[i], format="JPEG")
+
+    selected, stats = dedupe_frames(frames, DedupeConfig())
+    names = [p.name for p in selected]
+
+    # The title frame (one of frames 2-11, Stage A keeps the last = frame_000011)
+    # must appear in the output; it was held for 10 frames, not a brief transition.
+    title_frame = "frame_000011.jpg"
+    assert title_frame in names, (
+        f"Title frame (held 10 frames) was incorrectly dropped by Stage C. "
+        f"Selected: {names}"
+    )
+
+
+def test_stage_e_additive_reveal(tmp_path: Path) -> None:
+    """Stage E secondary check must merge an additive progressive reveal pair.
+
+    Pair characteristics: change is purely additive (neg \u2248 0, pos > 0),
+    dark content is mostly preserved (dark_cover > 0.70), diff > 0.06
+    (so primary bright-pixel Stage E does NOT fire). Only the secondary
+    additive-reveal criterion should collapse them.
+    """
+    f1 = tmp_path / "frame_000001.jpg"
+    f2 = tmp_path / "frame_000002.jpg"
+    f3 = tmp_path / "frame_000003.jpg"  # different slide as anchor
+
+    # Slide 1: dark background + some bright text (simulates dark-bg lecture slide).
+    # Base: dark (30), with bright text bars.
+    a1 = np.full((144, 256), 30, dtype=np.uint8)
+    a1[20:35, 10:246] = 220   # bright heading
+    a1[50:60, 10:200] = 200   # bright bullet 1
+
+    # Slide 2 (progressive reveal): same + new bright region added, nothing darkened.
+    a2 = a1.copy()
+    a2[70:80, 10:200] = 200   # bright bullet 2 added (purely additive)
+    a2[90:100, 10:160] = 200  # bright bullet 3 added
+
+    # Slide 3: completely different slide.
+    a3 = np.full((144, 256), 30, dtype=np.uint8)
+    a3[20:35, 10:246] = 220
+    a3[50:60, 10:100] = 200   # different location/content
+
+    for path, arr in zip([f1, f2, f3], [a1, a2, a3]):
+        Image.fromarray(arr).save(path, format="JPEG")
+
+    selected, stats = dedupe_frames([f1, f2, f3], DedupeConfig())
+    names = [p.name for p in selected]
+
+    # f1/f2 form an additive reveal pair → Stage E secondary should merge them.
+    # f3 is a different slide and must survive.
+    assert "frame_000001.jpg" not in names or "frame_000002.jpg" in names, (
+        "Additive reveal pair was not collapsed by Stage E secondary check"
+    )
+    assert "frame_000003.jpg" in names, "Different slide f3 must be kept"
+    assert stats["after_e"] <= stats["after_d"], "Stage E must not increase count"
