@@ -1,0 +1,5 @@
+{
+  "python.analysis.extraPaths": [
+    "/Users/victor/.openclaw/workspace/projects/youtube-slides-mvp/src"
+  ]
+}

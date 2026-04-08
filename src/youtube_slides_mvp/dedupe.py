@@ -18,7 +18,9 @@ class DedupeConfig:
     # held for this many or more original frames in Stage A (i.e. it represents
     # real content, not a brief flash between two dark frames).
     transition_min_hold: int = 3
-    progressive_lookback: int = 20
+    # Stage E lookback window: increased from 20 to 50 to catch reveal pairs even when
+    # separated by 20+ intermediate frames in the frame sequence.
+    progressive_lookback: int = 50
     progressive_diff_th: float = 0.06
     progressive_hash_th: int = 10
     progressive_cover_th: float = 0.95

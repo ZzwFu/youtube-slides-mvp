@@ -111,11 +111,19 @@ def main() -> int:
     )
     print(f"  Completed pages: {completed_pages}")
 
+    # Final cleanup: merge adjacent pages satisfying Stage E criteria
+    selected_orig, selected_rows, final_merged = _cli._cleanup_close_pairs(
+        selected_orig=selected_orig,
+        selected_rows=selected_rows,
+    )
+    print(f"  Final cleanup merged: {final_merged}")
+
     manifest.metadata["dedupe"].update({
         "selected_count": len(selected_orig),
         "dropped_blank_pages": dropped_blank,
         "rescued_gap_pages": rescued_gap,
         "completed_pages": completed_pages,
+        "final_cleanup_merged": final_merged,
     })
 
     # ── D8 Render ────────────────────────────────────────────────────────────
@@ -146,15 +154,20 @@ def main() -> int:
     }
 
     # ── D9 Quality ───────────────────────────────────────────────────────────
-    qmetrics = compute_quality_metrics(selected_orig, selected_rows)
-    gate = evaluate_gate(qmetrics)
-    write_quality_report(paths.artifacts_dir / "quality_report.json", qmetrics, gate)
-    write_quality_markdown(paths.artifacts_dir / "quality_report.md", qmetrics, gate)
+    qmetrics = compute_quality_metrics(
+        raw_count=len(raw_frames),
+        selected_count=len(selected_orig),
+        suspect_windows=0,  # no OCR in this script
+    )
+    gated = evaluate_gate(qmetrics)
+    write_quality_report(paths.artifacts_dir / "quality_report.json", gated)
+    write_quality_markdown(paths.artifacts_dir / "quality_report.md", gated)
     manifest.metadata["quality"] = {
-        "gate_pass": gate.passed,
-        "score": qmetrics.get("score", 0),
+        "report_json": str(paths.artifacts_dir / "quality_report.json"),
+        "report_md": str(paths.artifacts_dir / "quality_report.md"),
+        **gated,
     }
-    print(f"  Quality gate: {'PASS' if gate.passed else 'FAIL'}")
+    print(f"  Quality gate: {'PASS' if gated.get('passed', False) else 'FAIL'}")
 
     manifest.transition(TaskStatus.DONE, "reuse-frames D3-D10 pipeline complete")
     write_manifest(manifest, paths.manifest_path)

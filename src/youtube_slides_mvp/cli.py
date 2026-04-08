@@ -433,6 +433,98 @@ def _complete_pages(
     return out_orig, out_rows, completed
 
 
+def _cleanup_close_pairs(
+    selected_orig: list[Path],
+    selected_rows: list[dict[str, int | float | str]],
+    diff_th: float = 0.008,
+    dark_cover_th: float = 0.70,
+    dark_add_max: float = 0.25,
+) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
+    """
+    Post-processing cleanup: merge adjacent pages that satisfy Stage E secondary criteria.
+    This catches duplicate reveals (e.g., progressive reveal pairs) that slipped through
+    dedupe_frames due to lookback window boundaries or post-processing reintroductions.
+
+    Applies two checks:
+    1. Primary (Stage E): Direct pixel-change similarity check (diff < diff_th)
+    2. Secondary (Stage E additive): Dark preservation + minimal new dark pixels
+
+    If adjacent pages satisfy either check, keep the newer (higher-index) page
+    and mark the older one for removal.
+    """
+    if len(selected_orig) < 2:
+        return selected_orig, selected_rows, 0
+
+    def _load(path: Path) -> np.ndarray:
+        return np.asarray(
+            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
+
+    cache: dict[str, np.ndarray] = {}
+    to_remove: set[int] = set()
+    merged = 0
+    debug_candidates: list[tuple[int, int, float, float, float]] = []
+
+    i = 0
+    while i < len(selected_orig) - 1:
+        if i in to_remove:
+            i += 1
+            continue
+
+        path_curr = selected_orig[i]
+        path_next = selected_orig[i + 1]
+
+        if path_curr.name not in cache:
+            cache[path_curr.name] = _load(path_curr)
+        if path_next.name not in cache:
+            cache[path_next.name] = _load(path_next)
+
+        arr_curr = cache[path_curr.name]
+        arr_next = cache[path_next.name]
+
+        # Check Stage E primary: direct pixel-change similarity.
+        d = float(np.mean(np.abs(arr_curr.astype(np.float32) - arr_next.astype(np.float32))) / 255.0)
+
+        should_merge = False
+        dc, da = 0.0, 0.0
+        if d < diff_th:
+            should_merge = True
+        else:
+            # Check Stage E secondary: dark preservation + minimal additive dark.
+            dc, da = _dark_cover(arr_curr, arr_next)
+            if dc >= dark_cover_th and da <= dark_add_max:
+                should_merge = True
+
+        # Record candidate for debugging
+        debug_candidates.append((i, i + 1, d, dc, da))
+
+        if should_merge:
+            # Mark the current (older) page for removal; keep the next.
+            to_remove.add(i)
+            merged += 1
+            print(f"  [cleanup] merge p{i+1}/p{i+2}: d={d:.6f}, dc={dc:.4f}, da={da:.4f}")
+            # Skip over the next page too; continue with the page after.
+            i += 2
+        else:
+            i += 1
+
+    # Build new lists, excluding removed indices.
+    new_orig = [p for i, p in enumerate(selected_orig) if i not in to_remove]
+    new_rows = [r for i, r in enumerate(selected_rows) if i not in to_remove]
+
+    # Reindex page numbers.
+    for page, row in enumerate(new_rows, start=1):
+        row["page"] = page
+
+    if merged > 0:
+        print(f"[cleanup] total merged: {merged} pairs from {len(selected_orig)} pages → {len(new_orig)} pages")
+    else:
+        print(f"[cleanup] no pairs merged (checked {len(debug_candidates)} adjacent pairs)")
+
+    return new_orig, new_rows, merged
+
+
 def run_pipeline(
     url: str,
     outdir: Path,
@@ -674,7 +766,13 @@ def run_pipeline(
             frames_raw_dir=paths.frames_raw_dir,
         )
         refill_meta["completed_pages"] = completed_pages
-
+        # Final cleanup: merge any remaining close pairs (from post-processing artifacts)
+        # that should have been merged by Stage E but slipped through due to lookback limits.
+        selected_orig, selected_rows, final_merged = _cleanup_close_pairs(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+        )
+        refill_meta["final_cleanup_merged"] = final_merged
         write_ocr_report(ocr_report_path, signals, windows)
         manifest.metadata["ocr"] = {
             "ok": not skip_ocr,
