@@ -725,16 +725,29 @@ def _confidence_refill_pages(
     min_gap_sec: float = 15.0,
     novelty_th: float = 0.06,
     min_endpoint_dc: float = 0.75,
+    strong_first_th: float = 0.07,
+    secondary_novelty_th: float = 0.04,
+    bridge_min_gap_sec: float = 40.0,
+    bridge_near_min: float = 0.035,
+    bridge_near_max: float = 0.06,
+    bridge_far_min: float = 0.10,
+    bridge_far_near_ratio: float = 2.0,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
     """Post-FSM adaptive refill for wide transition gaps.
 
     Computes the median page-transition interval (τ) from the current selection.
     Any adjacent pair whose gap exceeds max(min_gap_sec, gap_factor × τ) is
-    treated as a candidate for missing pages, but only when the two boundary
-    slides share high dark-pixel overlap (min_endpoint_dc) — indicating the gap
-    spans a progressive reveal rather than a true topic transition. For each such
-    pair, estimates a small k from Δt/τ and greedily picks up to k frames
-    from the raw pool that maximise mutual separation.
+     treated as a candidate for missing pages.
+
+     Two generalized paths are used:
+     1) High-overlap gaps (dc >= min_endpoint_dc): progressive-reveal refill.
+         The first pick uses novelty_th. If the first pick is very strong
+         (>= strong_first_th), later picks in the same gap may use
+         secondary_novelty_th to avoid under-filling long reveal chains.
+     2) Low-overlap gaps (dc < min_endpoint_dc): optional one-frame bridge.
+         Insert at most one frame when a candidate is strongly asymmetric to
+         endpoints (near one side, far from the other), which captures missing
+         transition pages without enabling broad low-dc overfill.
 
     Runs after the FSM so inserted frames are never re-collapsed.  No page-number
     hardcoding is needed: thresholds adapt to the actual pacing of the video.
@@ -771,8 +784,6 @@ def _confidence_refill_pages(
         t_a = times[i]
         t_b = times[i + 1]
         dt = t_b - t_a
-        if dt < wide_threshold:
-            continue
 
         p_a, p_b = selected_orig[i], selected_orig[i + 1]
         if p_a.name not in cache:
@@ -782,11 +793,15 @@ def _confidence_refill_pages(
         a_left = cache[p_a.name]
         a_right = cache[p_b.name]
 
-        # Gate: only refill gaps where both endpoints share significant dark-pixel
-        # overlap (same slide family / progressive reveal). Gaps between genuinely
-        # different slides have low dc and should not be filled.
+        # Endpoint overlap determines which refill path to use.
         dc_endpoints, _ = _dark_cover(a_left, a_right)
-        if dc_endpoints < min_endpoint_dc:
+
+        # High-overlap path needs a wide gap; low-overlap bridge path has its
+        # own (smaller) minimum duration gate.
+        if dc_endpoints >= min_endpoint_dc:
+            if dt < wide_threshold:
+                continue
+        elif dt < bridge_min_gap_sec:
             continue
 
         # Conservative estimate: large outlier gaps can add a small number of
@@ -817,28 +832,65 @@ def _confidence_refill_pages(
             if cp.name not in cache:
                 cache[cp.name] = _load(cp)
 
-        # Greedy max-separation: anchors start with both boundary slides.
-        anchors: list[np.ndarray] = [a_left, a_right]
         picked: list[tuple[Path, dict[str, int | float | str]]] = []
-        for _ in range(k):
-            best_score = -1.0
-            best_cp: Path | None = None
-            best_row: dict[str, int | float | str] | None = None
-            already_picked = {p.name for p, _ in picked}
+
+        if dc_endpoints >= min_endpoint_dc:
+            # High-overlap path: greedy max-separation with a two-level threshold.
+            anchors: list[np.ndarray] = [a_left, a_right]
+            first_pick_score: float | None = None
+            for _ in range(k):
+                best_score = -1.0
+                best_cp: Path | None = None
+                best_row: dict[str, int | float | str] | None = None
+                already_picked = {p.name for p, _ in picked}
+                for cp, row in sampled:
+                    if cp.name in selected_names or cp.name in already_picked:
+                        continue
+                    arr = cache[cp.name]
+                    score = min(_diff(arr, anc) for anc in anchors)
+                    if score > best_score:
+                        best_score = score
+                        best_cp = cp
+                        best_row = dict(row)
+
+                required_th = novelty_th
+                if first_pick_score is not None and first_pick_score >= strong_first_th:
+                    required_th = secondary_novelty_th
+
+                if best_cp is None or best_row is None or best_score < required_th:
+                    break
+
+                picked.append((best_cp, best_row))
+                anchors.append(cache[best_cp.name])
+                selected_names.add(best_cp.name)
+                if first_pick_score is None:
+                    first_pick_score = best_score
+        elif dt >= bridge_min_gap_sec:
+            # Low-overlap path: add at most one asymmetric bridge candidate.
+            best_bridge_score = -1.0
+            best_bridge_cp: Path | None = None
+            best_bridge_row: dict[str, int | float | str] | None = None
             for cp, row in sampled:
-                if cp.name in selected_names or cp.name in already_picked:
+                if cp.name in selected_names:
                     continue
                 arr = cache[cp.name]
-                score = min(_diff(arr, anc) for anc in anchors)
-                if score > best_score:
-                    best_score = score
-                    best_cp = cp
-                    best_row = dict(row)
-            if best_cp is None or best_score < novelty_th:
-                break
-            picked.append((best_cp, best_row))  # type: ignore[arg-type]
-            anchors.append(cache[best_cp.name])
-            selected_names.add(best_cp.name)
+                d_left = _diff(arr, a_left)
+                d_right = _diff(arr, a_right)
+                near = min(d_left, d_right)
+                far = max(d_left, d_right)
+                if near < bridge_near_min or near > bridge_near_max or far < bridge_far_min:
+                    continue
+                if far / max(near, 1e-6) < bridge_far_near_ratio:
+                    continue
+                score = near
+                if score > best_bridge_score:
+                    best_bridge_score = score
+                    best_bridge_cp = cp
+                    best_bridge_row = dict(row)
+
+            if best_bridge_cp is not None and best_bridge_row is not None:
+                picked.append((best_bridge_cp, best_bridge_row))
+                selected_names.add(best_bridge_cp.name)
 
         if picked:
             inserts.append((i + 1, picked))
