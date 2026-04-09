@@ -715,6 +715,147 @@ def _cleanup_close_pairs(
     return new_orig, new_rows, merged
 
 
+def _confidence_refill_pages(
+    selected_orig: list[Path],
+    selected_rows: list[dict[str, int | float | str]],
+    frame_rows: list[dict[str, int | float | str]],
+    frames_raw_dir: Path,
+    gap_factor: float = 2.5,
+    max_k: int = 4,
+    min_gap_sec: float = 15.0,
+    novelty_th: float = 0.06,
+) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
+    """Post-FSM adaptive refill for wide transition gaps.
+
+    Computes the median page-transition interval (τ) from the current selection.
+    Any adjacent pair whose gap exceeds max(min_gap_sec, gap_factor × τ) is
+    treated as a candidate for missing pages. For each such pair, estimates
+    a small k from Δt/τ and greedily picks up to k frames
+    from the raw pool that maximise mutual separation (max-min distance from all
+    already-anchored frames, starting with both boundary slides).
+
+    Runs after the FSM so inserted frames are never re-collapsed.  No page-number
+    hardcoding is needed: the threshold adapts to the actual pacing of the video.
+    """
+    if len(selected_orig) < 2:
+        return selected_orig, selected_rows, 0
+
+    def _load(path: Path) -> np.ndarray:
+        return np.asarray(
+            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
+
+    def _diff(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.mean(np.abs(a.astype(np.float32) - b.astype(np.float32))) / 255.0)
+
+    # Adaptive reference interval: median of all positive adjacent gaps.
+    times = [float(r.get("timestamp_sec", 0.0)) for r in selected_rows]
+    pos_gaps = [times[i + 1] - times[i] for i in range(len(times) - 1) if times[i + 1] > times[i]]
+    if not pos_gaps:
+        return selected_orig, selected_rows, 0
+    # Guard: clamp τ so dense-slide videos don't trigger on every small gap.
+    tau = float(max(5.0, np.median(pos_gaps)))
+    wide_threshold = max(min_gap_sec, gap_factor * tau)
+
+    selected_names: set[str] = {p.name for p in selected_orig}
+    cache: dict[str, np.ndarray] = {}
+    by_ts = sorted(frame_rows, key=lambda r: float(r.get("timestamp_sec", 0.0)))
+
+    # Collect (insert_after_index, [(path, row), ...]) for each triggered gap.
+    inserts: list[tuple[int, list[tuple[Path, dict[str, int | float | str]]]]] = []
+
+    for i in range(len(selected_rows) - 1):
+        t_a = times[i]
+        t_b = times[i + 1]
+        dt = t_b - t_a
+        if dt < wide_threshold:
+            continue
+
+        # Conservative estimate: large outlier gaps can add a small number of
+        # intermediate pages, but we do not try to fully densify the segment.
+        k = min(max_k, max(1, round(dt / tau) - 1))
+
+        p_a, p_b = selected_orig[i], selected_orig[i + 1]
+        if p_a.name not in cache:
+            cache[p_a.name] = _load(p_a)
+        if p_b.name not in cache:
+            cache[p_b.name] = _load(p_b)
+        a_left = cache[p_a.name]
+        a_right = cache[p_b.name]
+
+        # Gather candidate frames strictly inside the gap.
+        candidates: list[tuple[Path, dict[str, int | float | str]]] = []
+        for row in by_ts:
+            t = float(row.get("timestamp_sec", 0.0))
+            if t <= t_a + 1.0 or t >= t_b - 1.0:
+                continue
+            name = str(row.get("frame_name", ""))
+            if not name or name in selected_names:
+                continue
+            cpath = frames_raw_dir / name
+            if not cpath.exists() or _is_blank_transition_frame(cpath):
+                continue
+            candidates.append((cpath, dict(row)))
+
+        if not candidates:
+            continue
+
+        # Sub-sample to cap image-loading cost (≤60 frames per gap).
+        step = max(1, len(candidates) // 60)
+        sampled = candidates[::step]
+        for cp, _ in sampled:
+            if cp.name not in cache:
+                cache[cp.name] = _load(cp)
+
+        # Greedy max-separation: anchors start with both boundary slides.
+        anchors: list[np.ndarray] = [a_left, a_right]
+        picked: list[tuple[Path, dict[str, int | float | str]]] = []
+        for _ in range(k):
+            best_score = -1.0
+            best_cp: Path | None = None
+            best_row: dict[str, int | float | str] | None = None
+            already_picked = {p.name for p, _ in picked}
+            for cp, row in sampled:
+                if cp.name in selected_names or cp.name in already_picked:
+                    continue
+                arr = cache[cp.name]
+                score = min(_diff(arr, anc) for anc in anchors)
+                if score > best_score:
+                    best_score = score
+                    best_cp = cp
+                    best_row = dict(row)
+            if best_cp is None or best_score < novelty_th:
+                break
+            picked.append((best_cp, best_row))  # type: ignore[arg-type]
+            anchors.append(cache[best_cp.name])
+            selected_names.add(best_cp.name)
+
+        if picked:
+            inserts.append((i + 1, picked))
+
+    if not inserts:
+        return selected_orig, selected_rows, 0
+
+    out_orig = list(selected_orig)
+    out_rows = [dict(r) for r in selected_rows]
+    offset = 0
+    for base_idx, picks in inserts:
+        for j, (cp, row) in enumerate(picks):
+            out_orig.insert(base_idx + offset + j, cp)
+            out_rows.insert(base_idx + offset + j, row)
+        offset += len(picks)
+
+    paired = sorted(zip(out_orig, out_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
+    out_orig = [p for p, _ in paired]
+    out_rows = [dict(r) for _, r in paired]
+    for page, row in enumerate(out_rows, start=1):
+        row["page"] = page
+
+    total_inserted = sum(len(picks) for _, picks in inserts)
+    return out_orig, out_rows, total_inserted
+
+
 def run_pipeline(
     url: str,
     outdir: Path,
@@ -729,6 +870,7 @@ def run_pipeline(
     max_refill_windows: int,
     refill_window_cap_sec: float,
     complete_mode: str,
+    gap_refill_mode: str,
 ) -> int:
     if not url.startswith("http"):
         print("ERROR: --url must be a valid http(s) URL")
@@ -963,6 +1105,16 @@ def run_pipeline(
         )
         refill_meta["fsm_collapsed_pages"] = fsm_collapsed
         refill_meta["dropped_blank_pages"] = fsm_dropped_blank
+        confidence_refilled = 0
+        if gap_refill_mode == "confidence":
+            selected_orig, selected_rows, confidence_refilled = _confidence_refill_pages(
+                selected_orig=selected_orig,
+                selected_rows=selected_rows,
+                frame_rows=frame_rows,
+                frames_raw_dir=paths.frames_raw_dir,
+            )
+        refill_meta["gap_refill_mode"] = gap_refill_mode
+        refill_meta["confidence_refilled_pages"] = confidence_refilled
         selected_orig, selected_rows, merged_close_pairs = _cleanup_close_pairs(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
@@ -984,6 +1136,8 @@ def run_pipeline(
         manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
         manifest.metadata["dedupe"]["complete_mode"] = str(refill_meta.get("complete_mode", "iterative"))
         manifest.metadata["dedupe"]["fsm_collapsed_pages"] = int(refill_meta.get("fsm_collapsed_pages", 0))
+        manifest.metadata["dedupe"]["gap_refill_mode"] = str(refill_meta.get("gap_refill_mode", "none"))
+        manifest.metadata["dedupe"]["confidence_refilled_pages"] = int(refill_meta.get("confidence_refilled_pages", 0))
         manifest.metadata["dedupe"]["merged_close_pairs"] = int(refill_meta.get("merged_close_pairs", 0))
 
         manifest.transition(TaskStatus.RENDERING, "starting D8 rendering")
@@ -1060,6 +1214,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="iterative",
         help="page completion strategy for A/B comparison",
     )
+    run_cmd.add_argument(
+        "--gap-refill-mode",
+        choices=["none", "confidence"],
+        default="none",
+        help="optional post-FSM adaptive refill mode for wide low-confidence gaps",
+    )
 
     sub.add_parser("healthcheck", help="print tool versions")
     return parser
@@ -1086,6 +1246,7 @@ def main() -> int:
             max_refill_windows=int(args.max_refill_windows),
             refill_window_cap_sec=float(args.refill_window_cap_sec),
             complete_mode=str(args.complete_mode),
+            gap_refill_mode=str(args.gap_refill_mode),
         )
 
     parser.print_help()

@@ -29,8 +29,12 @@ URL = "http://youtube.com/watch?v=9eqDWJSvCx4"
 def main() -> int:
     src_id = sys.argv[1] if len(sys.argv) > 1 else "slide-20260408-034253"
     complete_mode = sys.argv[2] if len(sys.argv) > 2 else "iterative"
+    gap_refill_mode = sys.argv[3] if len(sys.argv) > 3 else "none"
     if complete_mode not in {"iterative", "single-pass"}:
         print(f"ERROR: complete_mode must be iterative or single-pass, got: {complete_mode}")
+        return 2
+    if gap_refill_mode not in {"none", "confidence"}:
+        print(f"ERROR: gap_refill_mode must be none or confidence, got: {gap_refill_mode}")
         return 2
     src_run = RUNS_DIR / src_id
     src_frames = src_run / "frames_raw"
@@ -120,6 +124,16 @@ def main() -> int:
     print(f"  FSM collapsed pages: {fsm_collapsed}")
     print(f"  Dropped blank frames: {dropped_blank}")
 
+    confidence_refilled = 0
+    if gap_refill_mode == "confidence":
+        selected_orig, selected_rows, confidence_refilled = _cli._confidence_refill_pages(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+            frame_rows=frame_rows,
+            frames_raw_dir=paths.frames_raw_dir,
+        )
+    print(f"  Confidence refilled pages: {confidence_refilled}")
+
     selected_orig, selected_rows, merged_close_pairs = _cli._cleanup_close_pairs(
         selected_orig=selected_orig,
         selected_rows=selected_rows,
@@ -133,6 +147,8 @@ def main() -> int:
         "completed_pages": completed_pages,
         "complete_mode": complete_mode,
         "fsm_collapsed_pages": fsm_collapsed,
+        "gap_refill_mode": gap_refill_mode,
+        "confidence_refilled_pages": confidence_refilled,
         "merged_close_pairs": merged_close_pairs,
     })
 
