@@ -724,18 +724,20 @@ def _confidence_refill_pages(
     max_k: int = 4,
     min_gap_sec: float = 15.0,
     novelty_th: float = 0.06,
+    min_endpoint_dc: float = 0.75,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
     """Post-FSM adaptive refill for wide transition gaps.
 
     Computes the median page-transition interval (τ) from the current selection.
     Any adjacent pair whose gap exceeds max(min_gap_sec, gap_factor × τ) is
-    treated as a candidate for missing pages. For each such pair, estimates
-    a small k from Δt/τ and greedily picks up to k frames
-    from the raw pool that maximise mutual separation (max-min distance from all
-    already-anchored frames, starting with both boundary slides).
+    treated as a candidate for missing pages, but only when the two boundary
+    slides share high dark-pixel overlap (min_endpoint_dc) — indicating the gap
+    spans a progressive reveal rather than a true topic transition. For each such
+    pair, estimates a small k from Δt/τ and greedily picks up to k frames
+    from the raw pool that maximise mutual separation.
 
     Runs after the FSM so inserted frames are never re-collapsed.  No page-number
-    hardcoding is needed: the threshold adapts to the actual pacing of the video.
+    hardcoding is needed: thresholds adapt to the actual pacing of the video.
     """
     if len(selected_orig) < 2:
         return selected_orig, selected_rows, 0
@@ -772,10 +774,6 @@ def _confidence_refill_pages(
         if dt < wide_threshold:
             continue
 
-        # Conservative estimate: large outlier gaps can add a small number of
-        # intermediate pages, but we do not try to fully densify the segment.
-        k = min(max_k, max(1, round(dt / tau) - 1))
-
         p_a, p_b = selected_orig[i], selected_orig[i + 1]
         if p_a.name not in cache:
             cache[p_a.name] = _load(p_a)
@@ -783,6 +781,17 @@ def _confidence_refill_pages(
             cache[p_b.name] = _load(p_b)
         a_left = cache[p_a.name]
         a_right = cache[p_b.name]
+
+        # Gate: only refill gaps where both endpoints share significant dark-pixel
+        # overlap (same slide family / progressive reveal). Gaps between genuinely
+        # different slides have low dc and should not be filled.
+        dc_endpoints, _ = _dark_cover(a_left, a_right)
+        if dc_endpoints < min_endpoint_dc:
+            continue
+
+        # Conservative estimate: large outlier gaps can add a small number of
+        # intermediate pages, but we do not try to fully densify the segment.
+        k = min(max_k, max(1, round(dt / tau) - 1))
 
         # Gather candidate frames strictly inside the gap.
         candidates: list[tuple[Path, dict[str, int | float | str]]] = []
