@@ -39,6 +39,17 @@ class DedupeConfig:
     fade_bidir_min: float = 0.008
     fade_diff_max: float = 0.12
     fade_balance_min: float = 0.40
+    # Stage A′: fade-start rollback.
+    # If prev→rep shows a meaningful balanced bidirectional change (blend start),
+    # roll back to keep the clean pre-fade frame as representative.
+    fade_blend_min: float = 0.01
+    fade_blend_bidir: float = 0.005
+    # Stage E cross-template guard: blocks secondary merges between different
+    # slides that share a visual template (similar layout → low dc, high da).
+    # True additive reveals are unidirectional (balance ≈ 0, dc ≈ 1.0).
+    cross_template_balance_min: float = 0.45
+    cross_template_dc_max: float = 0.80
+    cross_template_da_min: float = 0.10
     # Stage F: chain-based progressive-reveal collapse.
     # Frames are merged into a chain as long as each step diff is small AND
     # the total drift from the chain anchor stays below chain_anchor_max.
@@ -151,6 +162,26 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
         else:
             keep_idx.append(i)
 
+    # Stage A′: fade-start rollback.
+    # Stage A picks the last frame of each merge run as representative.
+    # A fade-start frame may barely differ from its predecessor (d ≈ 0.02)
+    # but already shows balanced bidirectional pixel change — a blend of the
+    # outgoing and incoming slides. Roll back to the clean pre-fade frame.
+    # Key discriminator: genuine progressive-reveal merges are unidirectional
+    # (pos >> neg, bal < 0.01), while fade-starts are balanced (bal > 0.40).
+    for k in range(len(keep_idx) - 1):
+        rep = keep_idx[k]
+        if rep == 0:
+            continue
+        prev_frame = rep - 1
+        d_pr = _diff(arrays[prev_frame], arrays[rep])
+        if d_pr <= cfg.fade_blend_min or d_pr > cfg.adjacent_diff_th:
+            continue
+        neg_pr, pos_pr = _directional_change(arrays[prev_frame], arrays[rep])
+        bal = min(neg_pr, pos_pr) / (max(neg_pr, pos_pr) + 1e-9)
+        if neg_pr >= cfg.fade_blend_bidir and pos_pr >= cfg.fade_blend_bidir and bal >= cfg.fade_balance_min:
+            keep_idx[k] = prev_frame
+
     # Stage C: drop transition midpoint if previous and next are close but current differs strongly.
     # Guard: if this Stage-A slot represents >= transition_min_hold original frames the content
     # was held long enough to be real — don't classify it as a brief transition midpoint.
@@ -241,6 +272,19 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
                     and dc >= cfg.additive_dark_cover_th
                     and da <= cfg.additive_dark_add_th
                 )
+                # Cross-template guard: different slides from the same visual
+                # template can show additive-like metrics because they share
+                # layout/colors.  True additive reveals are unidirectional
+                # (pos >> neg), while cross-template pairs show balanced
+                # bidirectional change with moderate dark cover.
+                if secondary:
+                    bal = min(neg, pos) / (max(neg, pos) + 1e-9)
+                    if (
+                        bal >= cfg.cross_template_balance_min
+                        and dc < cfg.cross_template_dc_max
+                        and da > cfg.cross_template_da_min
+                    ):
+                        secondary = False
             else:
                 secondary = False
             if primary or secondary:
