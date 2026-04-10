@@ -722,9 +722,9 @@ def _confidence_refill_pages(
     frames_raw_dir: Path,
     max_k: int = 8,
     min_gap_sec: float = 15.0,
-    min_endpoint_dc: float = 0.75,
-    bridge_min_gap_sec: float = 40.0,
     min_group_frames: int = 2,
+    ep_prune_diff: float = 0.07,
+    ep_prune_neg: float = 0.008,
     max_rounds: int = 2,
     # Legacy params kept for call-site compat; unused.
     gap_factor: float = 2.5,
@@ -740,12 +740,11 @@ def _confidence_refill_pages(
 
     Uses a unified mini-FSM walk through gap candidates to group progressive-
     reveal chains, keeping only the last (most-complete) frame per group.
-    Groups whose representative is additive toward either endpoint are pruned
-    as incomplete reveals.  Single-frame groups are dropped as noise.
+    Groups whose representative is too close to either endpoint (additive or
+    diff <= ep_prune_diff) are pruned.  Single-frame groups are dropped as noise.
 
-    Gate criteria:
-    - High-overlap (dc >= min_endpoint_dc): dt >= min_gap_sec
-    - Low-overlap  (dc < min_endpoint_dc):  dt >= bridge_min_gap_sec
+    Gate: dt >= min_gap_sec.  Content-based filtering is handled entirely by
+    endpoint proximity pruning — no time-based bridge gate needed.
 
     Runs after the main FSM so inserted frames are never re-collapsed.
     """
@@ -800,14 +799,8 @@ def _confidence_refill_pages(
             a_left = cache[p_a.name]
             a_right = cache[p_b.name]
 
-            dc_endpoints, _ = _dark_cover(a_left, a_right)
-
-            # Gate: high-overlap gaps use min_gap_sec; low-overlap gaps need
-            # a wider minimum to avoid low-dc overfill.
-            if dc_endpoints >= min_endpoint_dc:
-                if dt < min_gap_sec:
-                    continue
-            elif dt < bridge_min_gap_sec:
+            # Universal time gate: skip trivially short gaps.
+            if dt < min_gap_sec:
                 continue
 
             # Gather candidate frames strictly inside the gap.
@@ -857,17 +850,35 @@ def _confidence_refill_pages(
                 groups.append(current_group)
 
             # Each group's representative is its last frame (most complete).
-            # Prune groups by endpoint-additive checks and minimum size.
+            # Prune groups whose rep is too close to either endpoint:
+            #  - canonical additive check (strict)
+            #  - proximity check: diff <= ep_prune_diff AND neg <= ep_prune_neg
+            #    catches borderline intermediates that barely fail _is_additive
+            #    (e.g. da=0.355 > 0.35) while preserving legitimate fills that
+            #    have low diff but high neg (content replacement, not reveal).
             picked: list[tuple[Path, dict[str, int | float | str]]] = []
             for grp in groups:
                 if len(grp) < min_group_frames:
                     continue
                 rep_cp, rep_row = grp[-1]
                 rep_arr = cache[rep_cp.name]
+                # Right endpoint pruning
                 if _is_additive(rep_arr, a_right):
-                    continue  # incomplete reveal of right endpoint
-                if _is_additive(a_left, rep_arr) and not picked:
-                    continue  # first group is just completion of left endpoint
+                    continue
+                d_r = _diff(rep_arr, a_right)
+                if d_r <= ep_prune_diff:
+                    neg_r, _ = _directional_change(rep_arr, a_right)
+                    if neg_r <= ep_prune_neg:
+                        continue  # borderline reveal of right endpoint
+                # Left endpoint pruning (first group only)
+                if not picked:
+                    if _is_additive(a_left, rep_arr):
+                        continue
+                    d_l = _diff(a_left, rep_arr)
+                    if d_l <= ep_prune_diff:
+                        neg_l, _ = _directional_change(a_left, rep_arr)
+                        if neg_l <= ep_prune_neg:
+                            continue  # borderline completion of left endpoint
                 picked.append((rep_cp, dict(rep_row)))
                 selected_names.add(rep_cp.name)
 
