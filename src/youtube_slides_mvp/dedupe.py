@@ -32,6 +32,13 @@ class DedupeConfig:
     additive_neg_max: float = 0.025
     additive_dark_cover_th: float = 0.70
     additive_dark_add_th: float = 0.25
+    # Stage D′: fade-midpoint detection.
+    # Fade frames sit on the "line" between two slides (betweenness ≈ 1.0)
+    # and show balanced bidirectional pixel change (both neg and pos above min).
+    fade_betweenness_max: float = 1.15
+    fade_bidir_min: float = 0.008
+    fade_diff_max: float = 0.12
+    fade_balance_min: float = 0.40
     # Stage F: chain-based progressive-reveal collapse.
     # Frames are merged into a chain as long as each step diff is small AND
     # the total drift from the chain anchor stays below chain_anchor_max.
@@ -168,6 +175,35 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
         c_idx.append(keep_idx[-1])
 
     # Stage D: final rendered-sequence dedupe
+    # D′: fade-midpoint removal. Fade frames sit geometrically between two
+    # slides: betweenness ≈ 1.0 (d(a,b)+d(b,c) ≈ d(a,c)) with balanced
+    # bidirectional pixel change (both neg and pos significant).
+    if len(c_idx) >= 3:
+        changed = True
+        while changed:
+            changed = False
+            new_c: list[int] = [c_idx[0]]
+            for pos_i in range(1, len(c_idx) - 1):
+                a, b, c = c_idx[pos_i - 1], c_idx[pos_i], c_idx[pos_i + 1]
+                d_ab = _diff(arrays[a], arrays[b])
+                d_bc = _diff(arrays[b], arrays[c])
+                d_ac = _diff(arrays[a], arrays[c])
+                betweenness = (d_ab + d_bc) / (d_ac + 1e-9)
+                if betweenness <= cfg.fade_betweenness_max:
+                    neg, pos_v = _directional_change(arrays[a], arrays[b])
+                    balance = min(neg, pos_v) / (max(neg, pos_v) + 1e-9)
+                    if (
+                        d_ab <= cfg.fade_diff_max
+                        and neg >= cfg.fade_bidir_min
+                        and pos_v >= cfg.fade_bidir_min
+                        and balance >= cfg.fade_balance_min
+                    ):
+                        changed = True
+                        continue  # skip b — it's a fade midpoint
+                new_c.append(c_idx[pos_i])
+            new_c.append(c_idx[-1])
+            c_idx = new_c
+
     out_idx = [c_idx[0]] if c_idx else []
     for i in c_idx[1:]:
         j = out_idx[-1]
