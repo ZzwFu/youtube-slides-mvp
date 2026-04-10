@@ -720,37 +720,34 @@ def _confidence_refill_pages(
     selected_rows: list[dict[str, int | float | str]],
     frame_rows: list[dict[str, int | float | str]],
     frames_raw_dir: Path,
-    gap_factor: float = 2.5,
-    max_k: int = 4,
+    max_k: int = 8,
     min_gap_sec: float = 15.0,
-    novelty_th: float = 0.06,
     min_endpoint_dc: float = 0.75,
-    strong_first_th: float = 0.07,
-    secondary_novelty_th: float = 0.04,
     bridge_min_gap_sec: float = 40.0,
-    bridge_near_min: float = 0.035,
-    bridge_near_max: float = 0.06,
-    bridge_far_min: float = 0.10,
-    bridge_far_near_ratio: float = 2.0,
+    min_group_frames: int = 2,
+    max_rounds: int = 2,
+    # Legacy params kept for call-site compat; unused.
+    gap_factor: float = 2.5,
+    novelty_th: float = 0.0,
+    strong_first_th: float = 0.0,
+    secondary_novelty_th: float = 0.0,
+    bridge_near_min: float = 0.0,
+    bridge_near_max: float = 0.0,
+    bridge_far_min: float = 0.0,
+    bridge_far_near_ratio: float = 0.0,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
     """Post-FSM adaptive refill for wide transition gaps.
 
-    Computes the median page-transition interval (τ) from the current selection.
-    Any adjacent pair whose gap exceeds max(min_gap_sec, gap_factor × τ) is
-     treated as a candidate for missing pages.
+    Uses a unified mini-FSM walk through gap candidates to group progressive-
+    reveal chains, keeping only the last (most-complete) frame per group.
+    Groups whose representative is additive toward either endpoint are pruned
+    as incomplete reveals.  Single-frame groups are dropped as noise.
 
-     Two generalized paths are used:
-     1) High-overlap gaps (dc >= min_endpoint_dc): progressive-reveal refill.
-         The first pick uses novelty_th. If the first pick is very strong
-         (>= strong_first_th), later picks in the same gap may use
-         secondary_novelty_th to avoid under-filling long reveal chains.
-     2) Low-overlap gaps (dc < min_endpoint_dc): optional one-frame bridge.
-         Insert at most one frame when a candidate is strongly asymmetric to
-         endpoints (near one side, far from the other), which captures missing
-         transition pages without enabling broad low-dc overfill.
+    Gate criteria:
+    - High-overlap (dc >= min_endpoint_dc): dt >= min_gap_sec
+    - Low-overlap  (dc < min_endpoint_dc):  dt >= bridge_min_gap_sec
 
-    Runs after the FSM so inserted frames are never re-collapsed.  No page-number
-    hardcoding is needed: thresholds adapt to the actual pacing of the video.
+    Runs after the main FSM so inserted frames are never re-collapsed.
     """
     if len(selected_orig) < 2:
         return selected_orig, selected_rows, 0
@@ -764,157 +761,158 @@ def _confidence_refill_pages(
     def _diff(a: np.ndarray, b: np.ndarray) -> float:
         return float(np.mean(np.abs(a.astype(np.float32) - b.astype(np.float32))) / 255.0)
 
-    # Adaptive reference interval: median of all positive adjacent gaps.
-    times = [float(r.get("timestamp_sec", 0.0)) for r in selected_rows]
-    pos_gaps = [times[i + 1] - times[i] for i in range(len(times) - 1) if times[i + 1] > times[i]]
-    if not pos_gaps:
-        return selected_orig, selected_rows, 0
-    # Guard: clamp τ so dense-slide videos don't trigger on every small gap.
-    tau = float(max(5.0, np.median(pos_gaps)))
-    wide_threshold = max(min_gap_sec, gap_factor * tau)
+    def _is_additive(prev: np.ndarray, curr: np.ndarray) -> bool:
+        """Check if curr is a progressive reveal of prev."""
+        d = _diff(prev, curr)
+        if d > 0.10:
+            return False
+        neg, _ = _directional_change(prev, curr)
+        if neg > 0.002:
+            return False
+        dc, da = _dark_cover(prev, curr)
+        return dc >= 0.60 and da <= 0.35
 
-    selected_names: set[str] = {p.name for p in selected_orig}
     cache: dict[str, np.ndarray] = {}
     by_ts = sorted(frame_rows, key=lambda r: float(r.get("timestamp_sec", 0.0)))
+    curr_orig = list(selected_orig)
+    curr_rows = [dict(r) for r in selected_rows]
+    total_inserted = 0
 
-    # Collect (insert_after_index, [(path, row), ...]) for each triggered gap.
-    inserts: list[tuple[int, list[tuple[Path, dict[str, int | float | str]]]]] = []
+    for _round in range(max_rounds):
+        times = [float(r.get("timestamp_sec", 0.0)) for r in curr_rows]
+        pos_gaps = [times[j + 1] - times[j] for j in range(len(times) - 1) if times[j + 1] > times[j]]
+        if not pos_gaps:
+            break
 
-    for i in range(len(selected_rows) - 1):
-        t_a = times[i]
-        t_b = times[i + 1]
-        dt = t_b - t_a
+        selected_names: set[str] = {p.name for p in curr_orig}
+        inserts: list[tuple[int, list[tuple[Path, dict[str, int | float | str]]]]] = []
 
-        p_a, p_b = selected_orig[i], selected_orig[i + 1]
-        if p_a.name not in cache:
-            cache[p_a.name] = _load(p_a)
-        if p_b.name not in cache:
-            cache[p_b.name] = _load(p_b)
-        a_left = cache[p_a.name]
-        a_right = cache[p_b.name]
+        for i in range(len(curr_rows) - 1):
+            t_a = times[i]
+            t_b = times[i + 1]
+            dt = t_b - t_a
 
-        # Endpoint overlap determines which refill path to use.
-        dc_endpoints, _ = _dark_cover(a_left, a_right)
+            p_a, p_b = curr_orig[i], curr_orig[i + 1]
+            if p_a.name not in cache:
+                cache[p_a.name] = _load(p_a)
+            if p_b.name not in cache:
+                cache[p_b.name] = _load(p_b)
+            a_left = cache[p_a.name]
+            a_right = cache[p_b.name]
 
-        # High-overlap path needs a wide gap; low-overlap bridge path has its
-        # own (smaller) minimum duration gate.
-        if dc_endpoints >= min_endpoint_dc:
-            if dt < wide_threshold:
+            dc_endpoints, _ = _dark_cover(a_left, a_right)
+
+            # Gate: high-overlap gaps use min_gap_sec; low-overlap gaps need
+            # a wider minimum to avoid low-dc overfill.
+            if dc_endpoints >= min_endpoint_dc:
+                if dt < min_gap_sec:
+                    continue
+            elif dt < bridge_min_gap_sec:
                 continue
-        elif dt < bridge_min_gap_sec:
-            continue
 
-        # Conservative estimate: large outlier gaps can add a small number of
-        # intermediate pages, but we do not try to fully densify the segment.
-        k = min(max_k, max(1, round(dt / tau) - 1))
+            # Gather candidate frames strictly inside the gap.
+            candidates: list[tuple[Path, dict[str, int | float | str]]] = []
+            for row in by_ts:
+                t = float(row.get("timestamp_sec", 0.0))
+                if t <= t_a + 1.0 or t >= t_b - 1.0:
+                    continue
+                name = str(row.get("frame_name", ""))
+                if not name or name in selected_names:
+                    continue
+                cpath = frames_raw_dir / name
+                if not cpath.exists() or _is_blank_transition_frame(cpath):
+                    continue
+                candidates.append((cpath, dict(row)))
 
-        # Gather candidate frames strictly inside the gap.
-        candidates: list[tuple[Path, dict[str, int | float | str]]] = []
-        for row in by_ts:
-            t = float(row.get("timestamp_sec", 0.0))
-            if t <= t_a + 1.0 or t >= t_b - 1.0:
+            if not candidates:
                 continue
-            name = str(row.get("frame_name", ""))
-            if not name or name in selected_names:
-                continue
-            cpath = frames_raw_dir / name
-            if not cpath.exists() or _is_blank_transition_frame(cpath):
-                continue
-            candidates.append((cpath, dict(row)))
 
-        if not candidates:
-            continue
+            # Sub-sample to cap image-loading cost.
+            step = max(1, len(candidates) // 60)
+            sampled = candidates[::step]
+            for cp, _ in sampled:
+                if cp.name not in cache:
+                    cache[cp.name] = _load(cp)
 
-        # Sub-sample to cap image-loading cost (≤60 frames per gap).
-        step = max(1, len(candidates) // 60)
-        sampled = candidates[::step]
-        for cp, _ in sampled:
-            if cp.name not in cache:
-                cache[cp.name] = _load(cp)
+            # --- Mini-FSM walk: group consecutive additive frames ---
+            groups: list[list[tuple[Path, dict[str, int | float | str]]]] = []
+            current_group: list[tuple[Path, dict[str, int | float | str]]] = []
+            group_base_arr = a_left
 
-        picked: list[tuple[Path, dict[str, int | float | str]]] = []
-
-        if dc_endpoints >= min_endpoint_dc:
-            # High-overlap path: greedy max-separation with a two-level threshold.
-            anchors: list[np.ndarray] = [a_left, a_right]
-            first_pick_score: float | None = None
-            for _ in range(k):
-                best_score = -1.0
-                best_cp: Path | None = None
-                best_row: dict[str, int | float | str] | None = None
-                already_picked = {p.name for p, _ in picked}
-                for cp, row in sampled:
-                    if cp.name in selected_names or cp.name in already_picked:
-                        continue
-                    arr = cache[cp.name]
-                    score = min(_diff(arr, anc) for anc in anchors)
-                    if score > best_score:
-                        best_score = score
-                        best_cp = cp
-                        best_row = dict(row)
-
-                required_th = novelty_th
-                if first_pick_score is not None and first_pick_score >= strong_first_th:
-                    required_th = secondary_novelty_th
-
-                if best_cp is None or best_row is None or best_score < required_th:
-                    break
-
-                picked.append((best_cp, best_row))
-                anchors.append(cache[best_cp.name])
-                selected_names.add(best_cp.name)
-                if first_pick_score is None:
-                    first_pick_score = best_score
-        elif dt >= bridge_min_gap_sec:
-            # Low-overlap path: add at most one asymmetric bridge candidate.
-            best_bridge_score = -1.0
-            best_bridge_cp: Path | None = None
-            best_bridge_row: dict[str, int | float | str] | None = None
             for cp, row in sampled:
                 if cp.name in selected_names:
                     continue
                 arr = cache[cp.name]
-                d_left = _diff(arr, a_left)
-                d_right = _diff(arr, a_right)
-                near = min(d_left, d_right)
-                far = max(d_left, d_right)
-                if near < bridge_near_min or near > bridge_near_max or far < bridge_far_min:
+                is_add_to_base = _is_additive(group_base_arr, arr)
+                is_add_to_rep = bool(
+                    current_group and _is_additive(cache[current_group[-1][0].name], arr)
+                )
+                if is_add_to_base or is_add_to_rep:
+                    current_group.append((cp, row))
+                else:
+                    if current_group:
+                        groups.append(current_group)
+                    current_group = [(cp, row)]
+                    group_base_arr = arr
+
+            if current_group:
+                groups.append(current_group)
+
+            # Each group's representative is its last frame (most complete).
+            # Prune groups by endpoint-additive checks and minimum size.
+            picked: list[tuple[Path, dict[str, int | float | str]]] = []
+            for grp in groups:
+                if len(grp) < min_group_frames:
                     continue
-                if far / max(near, 1e-6) < bridge_far_near_ratio:
-                    continue
-                score = near
-                if score > best_bridge_score:
-                    best_bridge_score = score
-                    best_bridge_cp = cp
-                    best_bridge_row = dict(row)
+                rep_cp, rep_row = grp[-1]
+                rep_arr = cache[rep_cp.name]
+                if _is_additive(rep_arr, a_right):
+                    continue  # incomplete reveal of right endpoint
+                if _is_additive(a_left, rep_arr) and not picked:
+                    continue  # first group is just completion of left endpoint
+                picked.append((rep_cp, dict(rep_row)))
+                selected_names.add(rep_cp.name)
 
-            if best_bridge_cp is not None and best_bridge_row is not None:
-                picked.append((best_bridge_cp, best_bridge_row))
-                selected_names.add(best_bridge_cp.name)
+            # Cap at max_k, preferring groups whose reps are most novel.
+            if len(picked) > max_k:
+                scored = sorted(
+                    picked,
+                    key=lambda pr: -min(
+                        _diff(cache[pr[0].name], a_left),
+                        _diff(cache[pr[0].name], a_right),
+                    ),
+                )
+                for cp, _ in scored[max_k:]:
+                    selected_names.discard(cp.name)
+                picked = scored[:max_k]
 
-        if picked:
-            inserts.append((i + 1, picked))
+            if picked:
+                inserts.append((i + 1, picked))
 
-    if not inserts:
-        return selected_orig, selected_rows, 0
+        if not inserts:
+            break
 
-    out_orig = list(selected_orig)
-    out_rows = [dict(r) for r in selected_rows]
-    offset = 0
-    for base_idx, picks in inserts:
-        for j, (cp, row) in enumerate(picks):
-            out_orig.insert(base_idx + offset + j, cp)
-            out_rows.insert(base_idx + offset + j, row)
-        offset += len(picks)
+        out_orig = list(curr_orig)
+        out_rows = [dict(r) for r in curr_rows]
+        offset = 0
+        for base_idx, picks in inserts:
+            for j, (cp, row) in enumerate(picks):
+                out_orig.insert(base_idx + offset + j, cp)
+                out_rows.insert(base_idx + offset + j, row)
+            offset += len(picks)
 
-    paired = sorted(zip(out_orig, out_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
-    out_orig = [p for p, _ in paired]
-    out_rows = [dict(r) for _, r in paired]
-    for page, row in enumerate(out_rows, start=1):
-        row["page"] = page
+        paired = sorted(zip(out_orig, out_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
+        curr_orig = [p for p, _ in paired]
+        curr_rows = [dict(r) for _, r in paired]
+        for page, row in enumerate(curr_rows, start=1):
+            row["page"] = page
 
-    total_inserted = sum(len(picks) for _, picks in inserts)
-    return out_orig, out_rows, total_inserted
+        round_inserted = sum(len(picks) for _, picks in inserts)
+        total_inserted += round_inserted
+        if round_inserted <= 0:
+            break
+
+    return curr_orig, curr_rows, total_inserted
 
 
 def run_pipeline(
