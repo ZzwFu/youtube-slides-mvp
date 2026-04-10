@@ -723,7 +723,7 @@ def _confidence_refill_pages(
     max_k: int = 8,
     min_gap_sec: float = 15.0,
     min_endpoint_dc: float = 0.75,
-    bridge_min_gap_sec: float = 15.0,
+    bridge_min_gap_sec: float = 40.0,
     min_group_frames: int = 2,
     max_rounds: int = 2,
     # Legacy params kept for call-site compat; unused.
@@ -835,41 +835,45 @@ def _confidence_refill_pages(
                     cache[cp.name] = _load(cp)
 
             # --- Mini-FSM walk: group consecutive additive frames ---
+            # Fix 1: only check previous frame (current_rep), not group_base
             groups: list[list[tuple[Path, dict[str, int | float | str]]]] = []
             current_group: list[tuple[Path, dict[str, int | float | str]]] = []
-            group_base_arr = a_left
 
             for cp, row in sampled:
                 if cp.name in selected_names:
                     continue
                 arr = cache[cp.name]
-                is_add_to_base = _is_additive(group_base_arr, arr)
                 is_add_to_rep = bool(
                     current_group and _is_additive(cache[current_group[-1][0].name], arr)
                 )
-                if is_add_to_base or is_add_to_rep:
+                if is_add_to_rep:
                     current_group.append((cp, row))
                 else:
                     if current_group:
                         groups.append(current_group)
                     current_group = [(cp, row)]
-                    group_base_arr = arr
 
             if current_group:
                 groups.append(current_group)
 
-            # Each group's representative is its last frame (most complete).
-            # Prune groups by endpoint-additive checks and minimum size.
+            # Fix 2: reverse-scan for true representative.
+            # Find last frame in group NOT additive to right endpoint B.
+            # If all frames are additive to B, prune entire group.
             picked: list[tuple[Path, dict[str, int | float | str]]] = []
             for grp in groups:
                 if len(grp) < min_group_frames:
                     continue
-                rep_cp, rep_row = grp[-1]
-                rep_arr = cache[rep_cp.name]
-                if _is_additive(rep_arr, a_right):
-                    continue  # incomplete reveal of right endpoint
+                true_rep = None
+                for frame_cp, frame_row in reversed(grp):
+                    frame_arr = cache[frame_cp.name]
+                    if not _is_additive(frame_arr, a_right):
+                        true_rep = (frame_cp, frame_row, frame_arr)
+                        break
+                if true_rep is None:
+                    continue  # entire group additive to B — prune
+                rep_cp, rep_row, rep_arr = true_rep
                 if _is_additive(a_left, rep_arr) and not picked:
-                    continue  # first group is just completion of left endpoint
+                    continue  # first group just completes left endpoint
                 picked.append((rep_cp, dict(rep_row)))
                 selected_names.add(rep_cp.name)
 
