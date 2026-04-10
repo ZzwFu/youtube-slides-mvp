@@ -723,7 +723,7 @@ def _confidence_refill_pages(
     max_k: int = 8,
     min_gap_sec: float = 15.0,
     min_endpoint_dc: float = 0.75,
-    bridge_min_gap_sec: float = 40.0,
+    bridge_min_gap_sec: float = 15.0,
     min_group_frames: int = 2,
     max_rounds: int = 2,
     # Legacy params kept for call-site compat; unused.
