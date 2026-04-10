@@ -856,24 +856,18 @@ def _confidence_refill_pages(
             if current_group:
                 groups.append(current_group)
 
-            # Fix 2: reverse-scan for true representative.
-            # Find last frame in group NOT additive to right endpoint B.
-            # If all frames are additive to B, prune entire group.
+            # Each group's representative is its last frame (most complete).
+            # Prune groups by endpoint-additive checks and minimum size.
             picked: list[tuple[Path, dict[str, int | float | str]]] = []
             for grp in groups:
                 if len(grp) < min_group_frames:
                     continue
-                true_rep = None
-                for frame_cp, frame_row in reversed(grp):
-                    frame_arr = cache[frame_cp.name]
-                    if not _is_additive(frame_arr, a_right):
-                        true_rep = (frame_cp, frame_row, frame_arr)
-                        break
-                if true_rep is None:
-                    continue  # entire group additive to B — prune
-                rep_cp, rep_row, rep_arr = true_rep
+                rep_cp, rep_row = grp[-1]
+                rep_arr = cache[rep_cp.name]
+                if _is_additive(rep_arr, a_right):
+                    continue  # incomplete reveal of right endpoint
                 if _is_additive(a_left, rep_arr) and not picked:
-                    continue  # first group just completes left endpoint
+                    continue  # first group is just completion of left endpoint
                 picked.append((rep_cp, dict(rep_row)))
                 selected_names.add(rep_cp.name)
 
