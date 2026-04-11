@@ -39,11 +39,22 @@ class DedupeConfig:
     fade_bidir_min: float = 0.008
     fade_diff_max: float = 0.12
     fade_balance_min: float = 0.40
-    # Stage A′: fade-start rollback.
-    # If prev→rep shows a meaningful balanced bidirectional change (blend start),
-    # roll back to keep the clean pre-fade frame as representative.
+    # Stage A′: fade-start rollback (two-pass).
+    # Pass 1: clear fade-starts — d(prev, rep) > 0.01 with balanced bidir.
+    # Pass 2: subtle pre-fade drift — when a fade-out is confirmed AFTER the
+    # rep, walk back while d(prev, candidate) is in (drift_min, drift_max)
+    # with bidirectional change.  Catches reps that drifted 1–2 frames into
+    # a fade zone where each individual step is too small for Pass 1.
     fade_blend_min: float = 0.01
     fade_blend_bidir: float = 0.005
+    # Pass 2 thresholds
+    fade_drift_min: float = 0.002     # below this the frame is stable
+    fade_drift_max: float = 0.01      # above this it's a reveal step, not drift
+    fade_drift_bidir: float = 0.0005  # loose bidir floor for subtle blends
+    fade_out_min: float = 0.02        # d(rep, rep+1) threshold for fade-out
+    fade_out_bal_min: float = 0.35    # balance floor for fade-out detection
+    fade_out_bidir: float = 0.005     # per-channel floor for fade-out
+    fade_drift_max_walk: int = 3      # max backward steps
     # Stage E cross-template guard: blocks secondary merges between different
     # slides that share a visual template (similar layout → low dc, high da).
     # True additive reveals are unidirectional (balance ≈ 0, dc ≈ 1.0).
@@ -162,13 +173,8 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
         else:
             keep_idx.append(i)
 
-    # Stage A′: fade-start rollback.
-    # Stage A picks the last frame of each merge run as representative.
-    # A fade-start frame may barely differ from its predecessor (d ≈ 0.02)
-    # but already shows balanced bidirectional pixel change — a blend of the
-    # outgoing and incoming slides. Roll back to the clean pre-fade frame.
-    # Key discriminator: genuine progressive-reveal merges are unidirectional
-    # (pos >> neg, bal < 0.01), while fade-starts are balanced (bal > 0.40).
+    # Stage A′: fade-start rollback (two-pass).
+    # Pass 1: clear fade-starts — d(prev, rep) is moderate with balanced bidir.
     for k in range(len(keep_idx) - 1):
         rep = keep_idx[k]
         if rep == 0:
@@ -181,6 +187,37 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
         bal = min(neg_pr, pos_pr) / (max(neg_pr, pos_pr) + 1e-9)
         if neg_pr >= cfg.fade_blend_bidir and pos_pr >= cfg.fade_blend_bidir and bal >= cfg.fade_balance_min:
             keep_idx[k] = prev_frame
+
+    # Pass 2: subtle pre-fade drift.
+    # If the raw frame right after rep shows a fade-out (balanced bidir),
+    # walk back while d(prev, candidate) is a tiny bidirectional drift.
+    for k in range(len(keep_idx)):
+        rep = keep_idx[k]
+        if rep == 0 or rep + 1 >= len(arrays):
+            continue
+        # Confirm fade-out starts after rep
+        d_next = _diff(arrays[rep], arrays[rep + 1])
+        if d_next < cfg.fade_out_min:
+            continue
+        neg_n, pos_n = _directional_change(arrays[rep], arrays[rep + 1])
+        bal_n = min(neg_n, pos_n) / (max(neg_n, pos_n) + 1e-9)
+        if bal_n < cfg.fade_out_bal_min or neg_n < cfg.fade_out_bidir or pos_n < cfg.fade_out_bidir:
+            continue
+        # Walk backwards while subtle bidirectional drift exists
+        candidate = rep
+        for _ in range(cfg.fade_drift_max_walk):
+            if candidate <= 0:
+                break
+            prev_frame = candidate - 1
+            d_prev = _diff(arrays[prev_frame], arrays[candidate])
+            if d_prev <= cfg.fade_drift_min or d_prev > cfg.fade_drift_max:
+                break
+            neg_p, pos_p = _directional_change(arrays[prev_frame], arrays[candidate])
+            if neg_p < cfg.fade_drift_bidir or pos_p < cfg.fade_drift_bidir:
+                break
+            candidate = prev_frame
+        if candidate != rep:
+            keep_idx[k] = candidate
 
     # Stage C: drop transition midpoint if previous and next are close but current differs strongly.
     # Guard: if this Stage-A slot represents >= transition_min_hold original frames the content
