@@ -1079,8 +1079,7 @@ def run_pipeline(
         }
 
         if (
-            not skip_ocr
-            and windows
+            windows
             and video_path is not None
             and video_path.exists()
             and refill_multiplier > 1.0
@@ -1139,10 +1138,13 @@ def run_pipeline(
                 refill_meta["errors"] = errors
 
                 # Re-run OCR signals and windows after merge.
-                signals = run_ocr_signals(selected_orig, lang=ocr_lang)
+                if not skip_ocr:
+                    signals = run_ocr_signals(selected_orig, lang=ocr_lang)
+                    ocr_windows = detect_suspect_windows(selected_rows, signals)
+                else:
+                    ocr_windows = []
                 selected_norm_for_selected = [paths.frames_norm_dir / p.name for p in selected_orig if (paths.frames_norm_dir / p.name).exists()]
                 scene_windows = detect_scene_driven_windows(selected_norm_for_selected, selected_rows)
-                ocr_windows = detect_suspect_windows(selected_rows, signals)
                 windows = _merge_windows(scene_windows, ocr_windows)
                 refill_meta["scene_windows_after"] = len(scene_windows)
                 refill_meta["ocr_windows_after"] = len(ocr_windows)
