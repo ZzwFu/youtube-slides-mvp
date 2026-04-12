@@ -100,15 +100,16 @@ def main() -> int:
     manifest.metadata["dedupe"] = {"ok": True, "stats": dedupe_stats, "selected_count": len(selected_orig)}
 
     # ── Post-processing ──────────────────────────────────────────────────────
-    selected_orig, selected_rows, rescued_gap = _cli._rescue_gap_pages(
+    selected_orig, selected_rows, rescued_gap = _cli._refill_gaps(
         selected_orig=selected_orig,
         selected_rows=selected_rows,
         frame_rows=frame_rows,
         frames_raw_dir=paths.frames_raw_dir,
+        strategy="novelty",
     )
     print(f"  Rescued gap pages: {rescued_gap}")
 
-    selected_orig, selected_rows, completed_pages = _cli._complete_pages(
+    selected_orig, selected_rows, completed_pages, fsm_collapsed, dropped_blank = _cli._complete_pages(
         selected_orig=selected_orig,
         selected_rows=selected_rows,
         frame_rows=frame_rows,
@@ -116,21 +117,19 @@ def main() -> int:
         mode=complete_mode,
     )
     print(f"  Completed pages: {completed_pages}  mode={complete_mode}")
-
-    selected_orig, selected_rows, fsm_collapsed, dropped_blank = _cli._postprocess_additive_state_machine(
-        selected_orig=selected_orig,
-        selected_rows=selected_rows,
-    )
     print(f"  FSM collapsed pages: {fsm_collapsed}")
     print(f"  Dropped blank frames: {dropped_blank}")
 
     confidence_refilled = 0
     if gap_refill_mode == "confidence":
-        selected_orig, selected_rows, confidence_refilled = _cli._confidence_refill_pages(
+        selected_orig, selected_rows, confidence_refilled = _cli._refill_gaps(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
             frame_rows=frame_rows,
             frames_raw_dir=paths.frames_raw_dir,
+            strategy="fsm_group",
+            min_gap_sec=15.0,
+            max_rounds=2,
         )
     print(f"  Confidence refilled pages: {confidence_refilled}")
 
