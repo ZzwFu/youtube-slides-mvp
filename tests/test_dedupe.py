@@ -1,9 +1,10 @@
+import json
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from src.youtube_slides_mvp.dedupe import DedupeConfig, dedupe_frames
+from src.youtube_slides_mvp.dedupe import DedupeConfig, _block_features, dedupe_frames
 
 
 def _save(path: Path, value: int) -> None:
@@ -81,6 +82,62 @@ def test_stage_g_collapses_long_stable_run(tmp_path: Path) -> None:
     assert f3.name in [p.name for p in selected], "tail of stable run must be kept"
     assert f4.name in [p.name for p in selected], "motion frame must be kept"
     assert f1.name not in [p.name for p in selected], "non-tail stable frames should be dropped"
+
+
+# ── Card 4.2: _block_features + sidecar ──────────────────────────────────────
+
+def test_block_features_dimensions() -> None:
+    a = np.zeros((144, 256), dtype=np.uint8)
+    b = np.full((144, 256), 128, dtype=np.uint8)
+    feats = _block_features(a, b, grid=(4, 4))
+    assert len(feats) == 48  # 4*4*3
+
+
+def test_block_features_values_in_range() -> None:
+    rng = np.random.default_rng(42)
+    a = rng.integers(0, 256, (144, 256), dtype=np.uint8)
+    b = rng.integers(0, 256, (144, 256), dtype=np.uint8)
+    feats = _block_features(a, b)
+    assert all(0.0 <= v <= 1.0 for v in feats)
+
+
+def test_block_features_identical_arrays_zero() -> None:
+    a = np.full((144, 256), 100, dtype=np.uint8)
+    feats = _block_features(a, a)
+    assert all(v == 0.0 for v in feats)
+
+
+def test_sidecar_created_with_correct_structure(tmp_path: Path) -> None:
+    f1 = tmp_path / "frame_000001.jpg"
+    f2 = tmp_path / "frame_000002.jpg"
+    f3 = tmp_path / "frame_000003.jpg"
+    _save(f1, 120)
+    _save(f2, 121)
+    _save(f3, 240)
+
+    sidecar = tmp_path / "sidecar.json"
+    dedupe_frames([f1, f2, f3], DedupeConfig(), sidecar_path=sidecar)
+
+    assert sidecar.exists()
+    data = json.loads(sidecar.read_text())
+    assert "pairs" in data
+    for pair in data["pairs"]:
+        assert "frame_a" in pair
+        assert "frame_b" in pair
+        assert "block_features" in pair
+        assert "label" in pair
+        assert len(pair["block_features"]) == 48
+        assert pair["label"] in ("progressive", "different")
+
+
+def test_sidecar_not_created_by_default(tmp_path: Path) -> None:
+    f1 = tmp_path / "frame_000001.jpg"
+    f2 = tmp_path / "frame_000002.jpg"
+    _save(f1, 120)
+    _save(f2, 240)
+    sidecar = tmp_path / "sidecar.json"
+    dedupe_frames([f1, f2], DedupeConfig())
+    assert not sidecar.exists()
 
 
 def test_stage_g_keeps_short_stable_run(tmp_path: Path) -> None:

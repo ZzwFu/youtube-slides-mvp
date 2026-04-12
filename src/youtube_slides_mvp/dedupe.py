@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -147,7 +148,35 @@ def _sorted_unique(idx: list[int]) -> list[int]:
     return sorted(set(idx))
 
 
-def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dict[str, int]]:
+def _block_features(a: np.ndarray, b: np.ndarray, grid: tuple[int, int] = (4, 4)) -> list[float]:
+    """Compute per-block spatial difference features between two grayscale arrays.
+
+    Divides both arrays into grid[0] x grid[1] blocks and computes three values
+    per block: mean abs diff, mean negative change, mean positive change — all
+    normalized to [0, 1] by dividing by 255.  Returns a flat list of
+    grid[0] * grid[1] * 3 floats (48 values for the default 4×4 grid).
+    """
+    rows, cols = grid
+    h, w = a.shape
+    rh = h // rows
+    rw = w // cols
+    feats: list[float] = []
+    for r in range(rows):
+        for c in range(cols):
+            ra = a[r * rh : (r + 1) * rh, c * rw : (c + 1) * rw].astype(np.float32)
+            rb = b[r * rh : (r + 1) * rh, c * rw : (c + 1) * rw].astype(np.float32)
+            delta = rb - ra
+            feats.append(round(float(np.mean(np.abs(delta)) / 255.0), 6))
+            feats.append(round(float(np.mean(np.clip(-delta, 0, None)) / 255.0), 6))
+            feats.append(round(float(np.mean(np.clip(delta, 0, None)) / 255.0), 6))
+    return feats
+
+
+def dedupe_frames(
+    paths: list[Path],
+    cfg: DedupeConfig,
+    sidecar_path: Path | None = None,
+) -> tuple[list[Path], dict[str, int]]:
     if not paths:
         return [], {"input": 0, "after_a": 0, "after_c": 0, "after_d": 0}
 
@@ -287,6 +316,7 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
     # Secondary check: additive-reveal detection for light-bg + dark-text slides where
     # new content appears as bright pixels (neg ≈ 0, pos >> 0, dark text preserved).
     e_idx: list[int] = []
+    sidecar_pairs: list[dict] = []
     for i in out_idx:
         merged = False
         for back in range(len(e_idx) - 1, max(-1, len(e_idx) - 1 - cfg.progressive_lookback), -1):
@@ -325,6 +355,13 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
             else:
                 secondary = False
             if primary or secondary:
+                if sidecar_path is not None:
+                    sidecar_pairs.append({
+                        "frame_a": paths[j].name,
+                        "frame_b": paths[i].name,
+                        "block_features": _block_features(arrays[j], arrays[i]),
+                        "label": "progressive",
+                    })
                 e_idx[back] = i
                 merged = True
                 break
@@ -334,6 +371,22 @@ def dedupe_frames(paths: list[Path], cfg: DedupeConfig) -> tuple[list[Path], dic
     # Lookback replacement can mutate an earlier slot with a later frame index.
     # Normalize indices to keep output chronological.
     e_idx = _sorted_unique(e_idx)
+
+    # Write sidecar: Stage-E progressive pairs + adjacent non-merged pairs as training data.
+    if sidecar_path is not None:
+        for k in range(len(e_idx) - 1):
+            j, i = e_idx[k], e_idx[k + 1]
+            sidecar_pairs.append({
+                "frame_a": paths[j].name,
+                "frame_b": paths[i].name,
+                "block_features": _block_features(arrays[j], arrays[i]),
+                "label": "different",
+            })
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.write_text(
+            json.dumps({"pairs": sidecar_pairs}, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     selected = [paths[i] for i in e_idx]
     stats = {
