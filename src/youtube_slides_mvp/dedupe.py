@@ -172,13 +172,31 @@ def _block_features(a: np.ndarray, b: np.ndarray, grid: tuple[int, int] = (4, 4)
     return feats
 
 
+def _load_classifier(model_path: Path | None = None) -> object | None:
+    """Load a trained pair classifier from disk, or return None if unavailable."""
+    if model_path is None:
+        model_path = Path(__file__).resolve().parents[3] / "models" / "pair_classifier.pkl"
+    if not model_path.exists():
+        return None
+    try:
+        import pickle
+        with open(model_path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
 def dedupe_frames(
     paths: list[Path],
     cfg: DedupeConfig,
     sidecar_path: Path | None = None,
+    classifier_path: Path | None = None,
 ) -> tuple[list[Path], dict[str, int]]:
     if not paths:
         return [], {"input": 0, "after_a": 0, "after_c": 0, "after_d": 0}
+
+    # Load pair classifier if available (Card 4.3). Falls back to threshold logic.
+    clf = _load_classifier(classifier_path)
 
     arrays = [_load_gray(p) for p in paths]
     hashes = [_hash_bits(a) for a in arrays]
@@ -355,16 +373,28 @@ def dedupe_frames(
             else:
                 secondary = False
             if primary or secondary:
-                if sidecar_path is not None:
-                    sidecar_pairs.append({
-                        "frame_a": paths[j].name,
-                        "frame_b": paths[i].name,
-                        "block_features": _block_features(arrays[j], arrays[i]),
-                        "label": "progressive",
-                    })
-                e_idx[back] = i
-                merged = True
-                break
+                # Classifier override: if a trained model is available, use its
+                # prediction in place of the threshold logic.  Fallback to
+                # primary/secondary when model is absent or raises an error.
+                should_merge = True
+                if clf is not None:
+                    try:
+                        import numpy as _np
+                        feats = _np.array([_block_features(arrays[j], arrays[i])], dtype=_np.float32)
+                        should_merge = bool(clf.predict(feats)[0] == 1)
+                    except Exception:
+                        pass  # model error → keep threshold decision
+                if should_merge:
+                    if sidecar_path is not None:
+                        sidecar_pairs.append({
+                            "frame_a": paths[j].name,
+                            "frame_b": paths[i].name,
+                            "block_features": _block_features(arrays[j], arrays[i]),
+                            "label": "progressive",
+                        })
+                    e_idx[back] = i
+                    merged = True
+                    break
         if not merged:
             e_idx.append(i)
 
