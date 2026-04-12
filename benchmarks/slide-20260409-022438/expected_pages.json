@@ -1,0 +1,7 @@
+{
+  "expected_pages": 68,
+  "baseline_run": "slide-20260409-022438",
+  "complete_mode": "iterative",
+  "gap_refill_mode": "none",
+  "notes": "Baseline iterative/none run — 68 pages manually verified as the de-duplicated slide count."
+}
