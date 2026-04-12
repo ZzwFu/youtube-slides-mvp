@@ -14,6 +14,7 @@ from .health import run_healthcheck
 from .manifest import build_task_paths, ensure_task_dirs, make_task_id, write_manifest
 from .models import TaskManifest, TaskStatus
 from .ocr_refill import detect_suspect_windows, run_ocr_signals, write_ocr_report
+from .text_compare import compare_text_prefix, signals_to_text_map
 from .preprocess import load_mask_profile, preprocess_frames, write_mask_profile
 from .quality import compute_quality_metrics, evaluate_gate, write_quality_markdown, write_quality_report
 from .refill import extract_refill_window_frames, refill_rows_for_window, split_window_ranges
@@ -202,6 +203,7 @@ def _refill_gaps(
     min_group_frames: int = 2,
     ep_prune_diff: float = 0.07,
     ep_prune_neg: float = 0.008,
+    ocr_texts: dict[str, str] | None = None,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
     """Unified gap-refill: insert missing frames into wide temporal gaps.
 
@@ -225,7 +227,16 @@ def _refill_gaps(
     def _diff(a: np.ndarray, b: np.ndarray) -> float:
         return float(np.mean(np.abs(a.astype(np.float32) - b.astype(np.float32))) / 255.0)
 
-    def _is_additive(prev: np.ndarray, curr: np.ndarray) -> bool:
+    def _t(name: str) -> str:
+        return ocr_texts.get(name, "") if ocr_texts is not None else ""
+
+    def _is_additive(prev: np.ndarray, curr: np.ndarray, t_prev: str = "", t_curr: str = "") -> bool:
+        if t_prev and t_curr:
+            verdict = compare_text_prefix(t_prev, t_curr)
+            if verdict == "different":
+                return False
+            if verdict == "progressive":
+                return True
         d = _diff(prev, curr)
         if d > 0.10:
             return False
@@ -304,8 +315,11 @@ def _refill_gaps(
                     if cp.name in selected_set:
                         continue
                     arr = cache[cp.name]
+                    prev_name = current_group[-1][0].name if current_group else ""
                     is_add_to_rep = bool(
-                        current_group and _is_additive(cache[current_group[-1][0].name], arr)
+                        current_group and _is_additive(
+                            cache[prev_name], arr, _t(prev_name), _t(cp.name)
+                        )
                     )
                     if is_add_to_rep:
                         current_group.append((cp, row))
@@ -322,7 +336,7 @@ def _refill_gaps(
                         continue
                     rep_cp, rep_row = grp[-1]
                     rep_arr = cache[rep_cp.name]
-                    if _is_additive(rep_arr, a_right):
+                    if _is_additive(rep_arr, a_right, _t(rep_cp.name), _t(p_b.name)):
                         continue
                     d_r = _diff(rep_arr, a_right)
                     if d_r <= ep_prune_diff:
@@ -330,7 +344,7 @@ def _refill_gaps(
                         if neg_r <= ep_prune_neg:
                             continue
                     if not picked:
-                        if _is_additive(a_left, rep_arr):
+                        if _is_additive(a_left, rep_arr, _t(p_a.name), _t(rep_cp.name)):
                             continue
                         d_l = _diff(a_left, rep_arr)
                         if d_l <= ep_prune_diff:
@@ -393,6 +407,7 @@ def _complete_pages(
     fsm_min_dark_cover: float = 0.60,
     fsm_max_dark_add: float = 0.35,
     fsm_max_diff: float = 0.10,
+    ocr_texts: dict[str, str] | None = None,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int, int, int]:
     """Replace each selected page with its most-complete reveal state, then
     collapse any remaining adjacent progressive-reveal pairs and drop blank
@@ -521,15 +536,27 @@ def _complete_pages(
             if cur_p.name not in cache:
                 cache[cur_p.name] = _load(cur_p)
             cur_a = cache[cur_p.name]
-            d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
-            neg, _pos = _directional_change(cand_a, cur_a)
-            dc, da = _dark_cover(cand_a, cur_a)
-            additive_only = (
-                d <= fsm_max_diff
-                and neg <= fsm_max_neg
-                and dc >= fsm_min_dark_cover
-                and da <= fsm_max_dark_add
-            )
+            # OCR first-priority: text prefix → progressive, disjoint words → not additive.
+            if ocr_texts is not None:
+                ocr_v = compare_text_prefix(
+                    ocr_texts.get(cand_p.name, ""), ocr_texts.get(cur_p.name, "")
+                )
+            else:
+                ocr_v = "unknown"
+            if ocr_v == "different":
+                additive_only = False
+            elif ocr_v == "progressive":
+                additive_only = True
+            else:
+                d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
+                neg, _pos = _directional_change(cand_a, cur_a)
+                dc, da = _dark_cover(cand_a, cur_a)
+                additive_only = (
+                    d <= fsm_max_diff
+                    and neg <= fsm_max_neg
+                    and dc >= fsm_min_dark_cover
+                    and da <= fsm_max_dark_add
+                )
             if additive_only:
                 cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
                 collapsed += 1
@@ -849,12 +876,14 @@ def run_pipeline(
                 refill_meta["refill_frames"] = 0
                 refill_meta["refill_rows"] = 0
 
+        ocr_texts: dict[str, str] | None = signals_to_text_map(signals) if signals else None
         selected_orig, selected_rows, rescued_gap = _refill_gaps(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
             frame_rows=frame_rows,
             frames_raw_dir=paths.frames_raw_dir,
             strategy="novelty",
+            ocr_texts=ocr_texts,
         )
         refill_meta["rescued_gap_pages"] = rescued_gap
         selected_orig, selected_rows, completed_pages, fsm_collapsed, fsm_dropped_blank = _complete_pages(
@@ -863,6 +892,7 @@ def run_pipeline(
             frame_rows=frame_rows,
             frames_raw_dir=paths.frames_raw_dir,
             mode=complete_mode,
+            ocr_texts=ocr_texts,
         )
         refill_meta["completed_pages"] = completed_pages
         refill_meta["complete_mode"] = complete_mode
@@ -878,6 +908,7 @@ def run_pipeline(
                 strategy="fsm_group",
                 min_gap_sec=15.0,
                 max_rounds=2,
+                ocr_texts=ocr_texts,
             )
         refill_meta["gap_refill_mode"] = gap_refill_mode
         refill_meta["confidence_refilled_pages"] = confidence_refilled
