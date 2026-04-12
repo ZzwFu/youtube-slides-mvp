@@ -939,6 +939,7 @@ def run_pipeline(
     refill_window_cap_sec: float,
     complete_mode: str,
     gap_refill_mode: str,
+    expected_pages: int | None = None,
 ) -> int:
     if not url.startswith("http"):
         print("ERROR: --url must be a valid http(s) URL")
@@ -1240,6 +1241,7 @@ def run_pipeline(
             raw_count=len(frame_paths),
             selected_count=len(selected_orig),
             suspect_windows=len(windows),
+            expected_pages=expected_pages,
         )
         gated = evaluate_gate(metrics)
         quality_json = paths.artifacts_dir / "quality_report.json"
@@ -1290,6 +1292,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="optional post-FSM adaptive refill mode for wide low-confidence gaps",
     )
+    run_cmd.add_argument(
+        "--expected-pages",
+        type=int,
+        default=None,
+        help="expected slide count for quality gate (enables miss_rate and excess_rate)",
+    )
 
     sub.add_parser("healthcheck", help="print tool versions")
     return parser
@@ -1317,6 +1325,7 @@ def main() -> int:
             refill_window_cap_sec=float(args.refill_window_cap_sec),
             complete_mode=str(args.complete_mode),
             gap_refill_mode=str(args.gap_refill_mode),
+            expected_pages=int(args.expected_pages) if args.expected_pages is not None else None,
         )
 
     parser.print_help()
