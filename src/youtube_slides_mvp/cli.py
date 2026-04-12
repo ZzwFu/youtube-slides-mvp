@@ -20,6 +20,7 @@ from .quality import compute_quality_metrics, evaluate_gate, write_quality_markd
 from .refill import extract_refill_window_frames, refill_rows_for_window, split_window_ranges
 from .scene import detect_scene_driven_windows
 from .render import render_pdf_a, render_pdf_b_with_index, render_pdf_raw, write_slides_json
+from .frame_cache import FrameCache
 
 
 def _download_video(url: str, video_dir: Path, retries: int) -> tuple[bool, str]:
@@ -218,12 +219,6 @@ def _refill_gaps(
     if len(selected_orig) < 2 or len(selected_rows) != len(selected_orig):
         return selected_orig, selected_rows, 0
 
-    def _load(path: Path) -> np.ndarray:
-        return np.asarray(
-            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
-            dtype=np.uint8,
-        )
-
     def _diff(a: np.ndarray, b: np.ndarray) -> float:
         return float(np.mean(np.abs(a.astype(np.float32) - b.astype(np.float32))) / 255.0)
 
@@ -246,7 +241,7 @@ def _refill_gaps(
         dc, da = _dark_cover(prev, curr)
         return dc >= 0.60 and da <= 0.35
 
-    cache: dict[str, np.ndarray] = {}
+    fc = FrameCache()
     by_ts = sorted(frame_rows, key=lambda r: float(r.get("timestamp_sec", 0.0)))
     curr_orig = list(selected_orig)
     curr_rows = [dict(r) for r in selected_rows]
@@ -264,12 +259,8 @@ def _refill_gaps(
                 continue
 
             p_a, p_b = curr_orig[i], curr_orig[i + 1]
-            if p_a.name not in cache:
-                cache[p_a.name] = _load(p_a)
-            if p_b.name not in cache:
-                cache[p_b.name] = _load(p_b)
-            a_left = cache[p_a.name]
-            a_right = cache[p_b.name]
+            a_left = fc.get(p_a)
+            a_right = fc.get(p_b)
 
             candidates: list[tuple[Path, dict[str, int | float | str]]] = []
             for row in by_ts:
@@ -290,15 +281,14 @@ def _refill_gaps(
             step = max(1, len(candidates) // sample_size)
             sampled = candidates[::step]
             for cp, _ in sampled:
-                if cp.name not in cache:
-                    cache[cp.name] = _load(cp)
+                fc.get(cp)
 
             if strategy == "novelty":
                 best_path: Path | None = None
                 best_score = -1.0
                 best_row: dict[str, int | float | str] | None = None
                 for cp, row in sampled:
-                    score = min(_diff(cache[cp.name], a_left), _diff(cache[cp.name], a_right))
+                    score = min(_diff(fc.get(cp), a_left), _diff(fc.get(cp), a_right))
                     if score > best_score:
                         best_score = score
                         best_row = row
@@ -314,11 +304,11 @@ def _refill_gaps(
                 for cp, row in sampled:
                     if cp.name in selected_set:
                         continue
-                    arr = cache[cp.name]
+                    arr = fc.get(cp)
                     prev_name = current_group[-1][0].name if current_group else ""
                     is_add_to_rep = bool(
                         current_group and _is_additive(
-                            cache[prev_name], arr, _t(prev_name), _t(cp.name)
+                            fc.get(current_group[-1][0]), arr, _t(prev_name), _t(cp.name)
                         )
                     )
                     if is_add_to_rep:
@@ -335,7 +325,7 @@ def _refill_gaps(
                     if len(grp) < min_group_frames:
                         continue
                     rep_cp, rep_row = grp[-1]
-                    rep_arr = cache[rep_cp.name]
+                    rep_arr = fc.get(rep_cp)
                     if _is_additive(rep_arr, a_right, _t(rep_cp.name), _t(p_b.name)):
                         continue
                     d_r = _diff(rep_arr, a_right)
@@ -357,7 +347,7 @@ def _refill_gaps(
                 if len(picked) > max_k:
                     scored = sorted(
                         picked,
-                        key=lambda pr: -min(_diff(cache[pr[0].name], a_left), _diff(cache[pr[0].name], a_right)),
+                        key=lambda pr: -min(_diff(fc.get(pr[0]), a_left), _diff(fc.get(pr[0]), a_right)),
                     )
                     for cp, _ in scored[max_k:]:
                         selected_set.discard(cp.name)
@@ -415,11 +405,7 @@ def _complete_pages(
 
     Returns (out_orig, out_rows, completed, collapsed, dropped_blank).
     """
-    def _load(path: Path) -> np.ndarray:
-        return np.asarray(
-            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
-            dtype=np.uint8,
-        )
+    fc = FrameCache()
 
     # Phase 0: drop blank transition frames before the completion pass.
     pre_orig: list[Path] = []
@@ -435,7 +421,6 @@ def _complete_pages(
     if not pre_orig:
         return [], [], 0, 0, dropped_blank
 
-    cache: dict[str, np.ndarray] = {}
     # Freeze original neighbors so one page's replacement does not affect
     # another page's completion window.
     base_orig = list(pre_orig)
@@ -465,9 +450,7 @@ def _complete_pages(
         # In single-pass mode, run this loop at most once for A/B comparison.
         while True:
             t_current = float(current_row.get("timestamp_sec", 0.0))
-            if current_path.name not in cache:
-                cache[current_path.name] = _load(current_path)
-            a_page = cache[current_path.name]
+            a_page = fc.get(current_path)
 
             candidates = [
                 r for r in frame_rows
@@ -487,9 +470,7 @@ def _complete_pages(
                 cpath = frames_raw_dir / cname
                 if not cpath.exists() or _is_blank_transition_frame(cpath):
                     continue
-                if cname not in cache:
-                    cache[cname] = _load(cpath)
-                arr = cache[cname]
+                arr = fc.get(cpath)
                 d = float(np.mean(np.abs(a_page.astype(np.float32) - arr.astype(np.float32))) / 255.0)
                 if d < min_diff or d > max_diff:
                     continue
@@ -529,13 +510,9 @@ def _complete_pages(
     collapsed = 0
     if valid:
         cand_p, cand_r = valid[0]
-        if cand_p.name not in cache:
-            cache[cand_p.name] = _load(cand_p)
-        cand_a = cache[cand_p.name]
+        cand_a = fc.get(cand_p)
         for cur_p, cur_r in valid[1:]:
-            if cur_p.name not in cache:
-                cache[cur_p.name] = _load(cur_p)
-            cur_a = cache[cur_p.name]
+            cur_a = fc.get(cur_p)
             # OCR first-priority: text prefix → progressive, disjoint words → not additive.
             if ocr_texts is not None:
                 ocr_v = compare_text_prefix(
@@ -593,13 +570,7 @@ def _cleanup_close_pairs(
     if len(selected_orig) < 2:
         return selected_orig, selected_rows, 0
 
-    def _load(path: Path) -> np.ndarray:
-        return np.asarray(
-            Image.open(path).convert("L").resize((256, 144), Image.Resampling.BILINEAR),
-            dtype=np.uint8,
-        )
-
-    cache: dict[str, np.ndarray] = {}
+    fc = FrameCache()
     to_remove: set[int] = set()
     merged = 0
 
@@ -608,13 +579,8 @@ def _cleanup_close_pairs(
         path_curr = selected_orig[i]
         path_next = selected_orig[i + 1]
 
-        if path_curr.name not in cache:
-            cache[path_curr.name] = _load(path_curr)
-        if path_next.name not in cache:
-            cache[path_next.name] = _load(path_next)
-
-        arr_curr = cache[path_curr.name]
-        arr_next = cache[path_next.name]
+        arr_curr = fc.get(path_curr)
+        arr_next = fc.get(path_next)
 
         # Check Stage E primary: direct pixel-change similarity.
         d = float(np.mean(np.abs(arr_curr.astype(np.float32) - arr_next.astype(np.float32))) / 255.0)
