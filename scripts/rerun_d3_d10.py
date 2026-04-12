@@ -193,10 +193,25 @@ def main() -> int:
         "report_md": str(paths.artifacts_dir / "quality_report.md"),
         **gated,
     }
-    print(f"  Quality gate: {'PASS' if gated.get('passed', False) else 'FAIL'}")
+    print(f"  Quality gate: {'PASS' if gated.get('gate_pass', False) else 'FAIL'}")
 
     manifest.transition(TaskStatus.DONE, "reuse-frames D3-D10 pipeline complete")
     write_manifest(manifest, paths.manifest_path)
+
+    # ── Experiment log ───────────────────────────────────────────────────────
+    experiment_log = {
+        "task_id": tid,
+        "src_run": src_id,
+        "complete_mode": complete_mode,
+        "gap_refill_mode": gap_refill_mode,
+        "page_count": len(selected_orig),
+        "raw_frame_count": len(raw_frames),
+        "quality": {k: v for k, v in gated.items()},
+    }
+    exp_log_path = paths.artifacts_dir / "experiment_log.json"
+    exp_log_path.write_text(json.dumps(experiment_log, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    print(f"  Experiment log: {exp_log_path}")
+
     print(f"\nDone!  {RUNS_DIR}/{tid}/pdf/")
     return 0
 

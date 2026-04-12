@@ -2,5 +2,5 @@ runs/
 __pycache__/
 *.pyc
 .venv/
-DebugHistory-OpusInvolved.md
-project-history.md
+*DebugHistory*
+*project*history*
