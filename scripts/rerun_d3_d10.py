@@ -150,6 +150,17 @@ def main() -> int:
     )
     print(f"  Confidence refilled pages: {confidence_refilled}")
 
+    selected_orig, selected_rows, post_fsm_collapsed = _cli._fsm_collapse(
+        selected_orig=selected_orig,
+        selected_rows=selected_rows,
+        fsm_max_diff=0.03,
+        fsm_max_neg=0.007,
+        fsm_min_dark_cover=0.90,
+        fsm_max_dark_add=0.05,
+        enable_tier_b=False,
+    )
+    print(f"  Post-refill FSM collapsed: {post_fsm_collapsed}")
+
     selected_orig, selected_rows, merged_close_pairs = _cli._cleanup_close_pairs(
         selected_orig=selected_orig,
         selected_rows=selected_rows,

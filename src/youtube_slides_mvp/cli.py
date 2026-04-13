@@ -491,7 +491,7 @@ def _complete_pages(
     max_neg: float = 0.012,
     min_diff: float = 0.008,
     max_diff: float = 0.15,
-    fsm_max_neg: float = 0.0008,
+    fsm_max_neg: float = 0.02,
     fsm_min_dark_cover: float = 0.60,
     fsm_max_dark_add: float = 0.35,
     fsm_max_diff: float = 0.10,
@@ -626,12 +626,16 @@ def _complete_pages(
                 d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
                 neg, _pos = _directional_change(cand_a, cur_a)
                 dc, da = _dark_cover(cand_a, cur_a)
-                additive_only = (
+                # Tier A: small-delta progressive
+                tier_a = (
                     d <= fsm_max_diff
                     and neg <= fsm_max_neg
                     and dc >= fsm_min_dark_cover
                     and da <= fsm_max_dark_add
                 )
+                # Tier B: large-delta progressive (heavy addition, near-zero removal)
+                tier_b = neg <= 0.005 and dc >= 0.90 and da <= 0.10
+                additive_only = tier_a or tier_b
             if additive_only:
                 cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
                 collapsed += 1
@@ -645,6 +649,79 @@ def _complete_pages(
     for page, row in enumerate(final_rows, start=1):
         row["page"] = page
     return final_orig, final_rows, completed, collapsed, dropped_blank
+
+
+def _fsm_collapse(
+    selected_orig: list[Path],
+    selected_rows: list[dict[str, int | float | str]],
+    ocr_texts: dict[str, str] | None = None,
+    fsm_max_diff: float = 0.10,
+    fsm_max_neg: float = 0.02,
+    fsm_min_dark_cover: float = 0.60,
+    fsm_max_dark_add: float = 0.35,
+    enable_tier_b: bool = True,
+) -> tuple[list[Path], list[dict[str, int | float | str]], int]:
+    """Standalone FSM additive-pair collapse pass.
+
+    Walks adjacents in timeline order; when a pair is in a progressive-reveal
+    relationship, keep only the later (more complete) frame.
+
+    Two tiers:
+      Tier A (parameterized): small-delta progressive.
+      Tier B (fixed, opt-in): large-delta progressive — heavy addition with
+             near-zero removal (neg ≤ 0.005, dc ≥ 0.90, da ≤ 0.10).
+
+    Returns (out_orig, out_rows, collapsed_count).
+    """
+    if len(selected_orig) < 2:
+        return selected_orig, selected_rows, 0
+
+    fc = FrameCache()
+    valid = sorted(
+        zip(selected_orig, selected_rows),
+        key=lambda it: float(it[1].get("timestamp_sec", 0.0)),
+    )
+    out: list[tuple[Path, dict[str, int | float | str]]] = []
+    collapsed = 0
+    cand_p, cand_r = valid[0]
+    cand_a = fc.get(cand_p)
+    for cur_p, cur_r in valid[1:]:
+        cur_a = fc.get(cur_p)
+        if ocr_texts is not None:
+            ocr_v = compare_text_prefix(
+                ocr_texts.get(cand_p.name, ""), ocr_texts.get(cur_p.name, "")
+            )
+        else:
+            ocr_v = "unknown"
+        if ocr_v == "different":
+            additive_only = False
+        elif ocr_v == "progressive":
+            additive_only = True
+        else:
+            d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
+            neg, _pos = _directional_change(cand_a, cur_a)
+            dc, da = _dark_cover(cand_a, cur_a)
+            tier_a = (
+                d <= fsm_max_diff
+                and neg <= fsm_max_neg
+                and dc >= fsm_min_dark_cover
+                and da <= fsm_max_dark_add
+            )
+            tier_b = enable_tier_b and neg <= 0.005 and dc >= 0.90 and da <= 0.10
+            additive_only = tier_a or tier_b
+        if additive_only:
+            cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
+            collapsed += 1
+        else:
+            out.append((cand_p, cand_r))
+            cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
+    out.append((cand_p, cand_r))
+
+    final_orig = [p for p, _ in out]
+    final_rows = [dict(r) for _, r in out]
+    for page, row in enumerate(final_rows, start=1):
+        row["page"] = page
+    return final_orig, final_rows, collapsed
 
 
 def _cleanup_close_pairs(
@@ -977,6 +1054,17 @@ def run_pipeline(
         )
         refill_meta["gap_refill_mode"] = "confidence"
         refill_meta["confidence_refilled_pages"] = confidence_refilled
+        selected_orig, selected_rows, post_fsm_collapsed = _fsm_collapse(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+            ocr_texts=ocr_texts,
+            fsm_max_diff=0.03,
+            fsm_max_neg=0.007,
+            fsm_min_dark_cover=0.90,
+            fsm_max_dark_add=0.05,
+            enable_tier_b=False,
+        )
+        refill_meta["post_refill_fsm_collapsed"] = post_fsm_collapsed
         selected_orig, selected_rows, merged_close_pairs = _cleanup_close_pairs(
             selected_orig=selected_orig,
             selected_rows=selected_rows,
