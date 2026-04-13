@@ -74,7 +74,7 @@ Key optional flags:
 | `--gap-refill-mode` | `confidence` | Gap refill after completion: `confidence` (required) |
 | `--skip-ocr` | off | Skip OCR stage (scene-driven refill still runs) |
 | `--refill-multiplier` | `2.5` | D7 re-extraction FPS multiplier |
-| `--max-refill-windows` | `3` | Max suspect windows to re-extract |
+| `--max-refill-windows` | `0` | Max suspect windows to re-extract (`0` disables D7 refill) |
 
 ## Output layout
 

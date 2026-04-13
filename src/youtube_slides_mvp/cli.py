@@ -971,7 +971,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--ocr-lang", default="eng+chi_sim", help="pytesseract language string")
     run_cmd.add_argument("--skip-ocr", action="store_true", help="skip OCR stage")
     run_cmd.add_argument("--refill-multiplier", type=float, default=2.5, help="D7 refill fps multiplier")
-    run_cmd.add_argument("--max-refill-windows", type=int, default=3, help="max suspect windows to refill")
+    run_cmd.add_argument(
+        "--max-refill-windows",
+        type=int,
+        default=0,
+        help="max suspect windows to refill (0 disables D7 refill)",
+    )
     run_cmd.add_argument("--refill-window-cap-sec", type=float, default=60.0, help="max seconds per refill window")
     run_cmd.add_argument(
         "--complete-mode",
