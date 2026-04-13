@@ -252,6 +252,104 @@ def _refill_gaps(
         selected_set = {p.name for p in curr_orig}
         inserts: list[tuple[int, list[tuple[Path, dict[str, int | float | str]]]]] = []
 
+        # Prefix gap rescue: allow inserts before the first selected page.
+        if by_ts:
+            t_start = float(by_ts[0].get("timestamp_sec", 0.0))
+            t_first = float(curr_rows[0].get("timestamp_sec", t_start))
+            if t_first - t_start >= min_gap_sec:
+                p_right = curr_orig[0]
+                a_right = fc.get(p_right)
+
+                prefix_candidates: list[tuple[Path, dict[str, int | float | str]]] = []
+                for row in by_ts:
+                    t = float(row.get("timestamp_sec", 0.0))
+                    if t <= t_start + 1.0 or t >= t_first - 1.0:
+                        continue
+                    name = str(row.get("frame_name", ""))
+                    if not name or name in selected_set:
+                        continue
+                    cpath = frames_raw_dir / name
+                    if not cpath.exists() or _is_blank_transition_frame(cpath):
+                        continue
+                    prefix_candidates.append((cpath, dict(row)))
+
+                if prefix_candidates:
+                    step = max(1, len(prefix_candidates) // sample_size)
+                    sampled = prefix_candidates[::step]
+                    for cp, _ in sampled:
+                        fc.get(cp)
+
+                    if strategy == "novelty":
+                        best_path: Path | None = None
+                        best_ts = -1.0
+                        best_row: dict[str, int | float | str] | None = None
+                        for cp, row in sampled:
+                            arr = fc.get(cp)
+                            score = _diff(arr, a_right)
+                            if score < novelty_th:
+                                continue
+                            if _is_additive(arr, a_right, _t(cp.name), _t(p_right.name)):
+                                continue
+                            # Keep the latest valid pre-gap frame to avoid picking early fades.
+                            ts = float(row.get("timestamp_sec", 0.0))
+                            if ts > best_ts:
+                                best_ts = ts
+                                best_row = row
+                                best_path = cp
+                        if best_path is not None and best_row is not None:
+                            selected_set.add(best_path.name)
+                            inserts.append((0, [(best_path, dict(best_row))]))
+
+                    else:  # fsm_group
+                        groups: list[list[tuple[Path, dict[str, int | float | str]]]] = []
+                        current_group: list[tuple[Path, dict[str, int | float | str]]] = []
+                        for cp, row in sampled:
+                            if cp.name in selected_set:
+                                continue
+                            arr = fc.get(cp)
+                            prev_name = current_group[-1][0].name if current_group else ""
+                            is_add_to_rep = bool(
+                                current_group and _is_additive(
+                                    fc.get(current_group[-1][0]), arr, _t(prev_name), _t(cp.name)
+                                )
+                            )
+                            if is_add_to_rep:
+                                current_group.append((cp, row))
+                            else:
+                                if current_group:
+                                    groups.append(current_group)
+                                current_group = [(cp, row)]
+                        if current_group:
+                            groups.append(current_group)
+
+                        picked: list[tuple[Path, dict[str, int | float | str]]] = []
+                        for grp in groups:
+                            if len(grp) < min_group_frames:
+                                continue
+                            rep_cp, rep_row = grp[-1]
+                            rep_arr = fc.get(rep_cp)
+                            if _is_additive(rep_arr, a_right, _t(rep_cp.name), _t(p_right.name)):
+                                continue
+                            d_r = _diff(rep_arr, a_right)
+                            if d_r <= ep_prune_diff:
+                                neg_r, _ = _directional_change(rep_arr, a_right)
+                                if neg_r <= ep_prune_neg:
+                                    continue
+                            picked.append((rep_cp, dict(rep_row)))
+                            selected_set.add(rep_cp.name)
+
+                        if len(picked) > max_k:
+                            scored = sorted(
+                                picked,
+                                key=lambda pr: -_diff(fc.get(pr[0]), a_right),
+                            )
+                            for cp, _ in scored[max_k:]:
+                                selected_set.discard(cp.name)
+                            picked = scored[:max_k]
+
+                        if picked:
+                            inserts.append((0, picked))
+
         for i in range(len(curr_rows) - 1):
             t_a = float(curr_rows[i].get("timestamp_sec", 0.0))
             t_b = float(curr_rows[i + 1].get("timestamp_sec", 0.0))
