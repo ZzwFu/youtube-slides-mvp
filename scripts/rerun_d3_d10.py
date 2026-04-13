@@ -1,6 +1,6 @@
 """
 Reuse extracted frames from a previous run and execute D3-D10 directly.
-Usage: python scripts/rerun_d3_d10.py [source_run_id] [complete_mode]
+Usage: python scripts/rerun_d3_d10.py [source_run_id] [complete_mode] [gap_refill_mode=confidence]
 """
 from __future__ import annotations
 
@@ -27,15 +27,31 @@ RUNS_DIR = Path(__file__).parent.parent / "runs"
 URL = "http://youtube.com/watch?v=9eqDWJSvCx4"
 
 
+def _source_url_for_run(src_run: Path) -> str:
+    manifest_path = src_run / "manifest.json"
+    if not manifest_path.exists():
+        return URL
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return URL
+    source_url = payload.get("url")
+    if isinstance(source_url, str) and source_url:
+        return source_url
+    return URL
+
+
 def main() -> int:
     src_id = sys.argv[1] if len(sys.argv) > 1 else "slide-20260408-034253"
     complete_mode = sys.argv[2] if len(sys.argv) > 2 else "iterative"
-    gap_refill_mode = sys.argv[3] if len(sys.argv) > 3 else "none"
+    gap_refill_mode = "confidence"
+    if len(sys.argv) > 3:
+        gap_refill_mode = sys.argv[3].strip().lower()
     if complete_mode not in {"iterative", "single-pass"}:
         print(f"ERROR: complete_mode must be iterative or single-pass, got: {complete_mode}")
         return 2
-    if gap_refill_mode not in {"none", "confidence"}:
-        print(f"ERROR: gap_refill_mode must be none or confidence, got: {gap_refill_mode}")
+    if gap_refill_mode != "confidence":
+        print(f"ERROR: gap_refill_mode only supports confidence, got: {gap_refill_mode}")
         return 2
     src_run = RUNS_DIR / src_id
     src_frames = src_run / "frames_raw"
@@ -47,6 +63,8 @@ def main() -> int:
     if not src_manifest.exists():
         print(f"ERROR: {src_manifest} not found")
         return 1
+
+    source_url = _source_url_for_run(src_run)
 
     tid = make_task_id("slide")
     paths = build_task_paths(RUNS_DIR, tid)
@@ -64,8 +82,8 @@ def main() -> int:
     shutil.copy(src_manifest, paths.artifacts_dir / "frame_manifest.json")
 
     fps = 1.0
-    manifest = TaskManifest(task_id=tid, url=URL, outdir=str(RUNS_DIR), task_dir=str(paths.task_dir))
-    manifest.metadata["download"] = {"mode": "reuse-frames", "src_run": src_id, "ok": True}
+    manifest = TaskManifest(task_id=tid, url=source_url, outdir=str(RUNS_DIR), task_dir=str(paths.task_dir))
+    manifest.metadata["download"] = {"mode": "reuse-frames", "src_run": src_id, "source_url": source_url, "ok": True}
     manifest.metadata["extract"] = {"ok": True, "fps": fps, "frame_count": n_frames}
 
     # ── D3 Preprocess ────────────────────────────────────────────────────────
@@ -121,17 +139,15 @@ def main() -> int:
     print(f"  FSM collapsed pages: {fsm_collapsed}")
     print(f"  Dropped blank frames: {dropped_blank}")
 
-    confidence_refilled = 0
-    if gap_refill_mode == "confidence":
-        selected_orig, selected_rows, confidence_refilled = _cli._refill_gaps(
-            selected_orig=selected_orig,
-            selected_rows=selected_rows,
-            frame_rows=frame_rows,
-            frames_raw_dir=paths.frames_raw_dir,
-            strategy="fsm_group",
-            min_gap_sec=15.0,
-            max_rounds=2,
-        )
+    selected_orig, selected_rows, confidence_refilled = _cli._refill_gaps(
+        selected_orig=selected_orig,
+        selected_rows=selected_rows,
+        frame_rows=frame_rows,
+        frames_raw_dir=paths.frames_raw_dir,
+        strategy="fsm_group",
+        min_gap_sec=15.0,
+        max_rounds=2,
+    )
     print(f"  Confidence refilled pages: {confidence_refilled}")
 
     selected_orig, selected_rows, merged_close_pairs = _cli._cleanup_close_pairs(
@@ -162,7 +178,7 @@ def main() -> int:
     render_pdf_a(selected_orig, pdf_a)
     print(f"  slides.pdf              {pdf_a.stat().st_size / 1024 / 1024:.1f} MB  ({len(selected_orig)} pages)")
 
-    render_pdf_b_with_index(selected_orig, selected_rows, source_url=URL, out_pdf=pdf_b)
+    render_pdf_b_with_index(selected_orig, selected_rows, source_url=source_url, out_pdf=pdf_b)
     print(f"  slides_with_index.pdf   {pdf_b.stat().st_size / 1024 / 1024:.1f} MB")
 
     raw_frames = sorted(paths.frames_raw_dir.glob("frame_*.jpg"))
@@ -179,7 +195,7 @@ def main() -> int:
         "raw_frame_count": len(raw_frames),
     }
 
-    benchmark_report = evaluate_run_directory(paths.task_dir, benchmark_id=src_id)
+    benchmark_report = evaluate_run_directory(paths.task_dir)
     benchmark_json = paths.artifacts_dir / "benchmark_eval.json"
     benchmark_md = paths.artifacts_dir / "benchmark_eval.md"
     write_benchmark_evaluation(benchmark_json, benchmark_report)

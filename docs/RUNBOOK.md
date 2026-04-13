@@ -70,9 +70,10 @@ Exit code 0 = gate pass, 1 = gate fail or benchmark missing, 2 = usage error.
 ```bash
 python scripts/rerun_d3_d10.py <source_run_id> [complete_mode] [gap_refill_mode]
 # Examples:
-python scripts/rerun_d3_d10.py slide-20260409-022438 iterative none
 python scripts/rerun_d3_d10.py slide-20260409-022438 iterative confidence
 ```
+
+`gap_refill_mode` is confidence-only.
 
 Outputs `runs/<new_id>/artifacts/experiment_log.json` with page_count and quality metrics.
 If a benchmark exists for `<source_run_id>`, the rerun also writes `benchmark_eval.json` and `benchmark_eval.md` automatically.
@@ -83,7 +84,7 @@ Once you have multiple runs with sidecar data:
 
 ```bash
 # Collect sidecar data during rerun:
-python scripts/rerun_d3_d10.py slide-20260409-022438 iterative none
+python scripts/rerun_d3_d10.py slide-20260409-022438 iterative confidence
 # (edit rerun script to pass sidecar_path to dedupe_frames)
 
 # Train:

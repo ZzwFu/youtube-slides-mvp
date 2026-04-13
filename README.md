@@ -71,7 +71,7 @@ Key optional flags:
 | `--fps` | `1.0` | Frame extraction rate (frames/sec) |
 | `--expected-pages N` | none | Enable `miss_rate`/`excess_rate` quality gate |
 | `--complete-mode` | `iterative` | Page completion: `iterative` or `single-pass` |
-| `--gap-refill-mode` | `none` | Gap refill after completion: `none` or `confidence` |
+| `--gap-refill-mode` | `confidence` | Gap refill after completion: `confidence` (required) |
 | `--skip-ocr` | off | Skip OCR stage (scene-driven refill still runs) |
 | `--refill-multiplier` | `2.5` | D7 re-extraction FPS multiplier |
 | `--max-refill-windows` | `3` | Max suspect windows to re-extract |

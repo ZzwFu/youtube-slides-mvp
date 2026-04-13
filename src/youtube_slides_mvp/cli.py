@@ -635,6 +635,9 @@ def run_pipeline(
     if fps <= 0:
         print("ERROR: --fps must be > 0")
         return 2
+    if gap_refill_mode != "confidence":
+        print(f"ERROR: --gap-refill-mode only supports confidence, got: {gap_refill_mode}")
+        return 2
 
     tid = task_id or make_task_id("slide")
     paths = build_task_paths(outdir, tid)
@@ -864,19 +867,17 @@ def run_pipeline(
         refill_meta["complete_mode"] = complete_mode
         refill_meta["fsm_collapsed_pages"] = fsm_collapsed
         refill_meta["dropped_blank_pages"] = fsm_dropped_blank
-        confidence_refilled = 0
-        if gap_refill_mode == "confidence":
-            selected_orig, selected_rows, confidence_refilled = _refill_gaps(
-                selected_orig=selected_orig,
-                selected_rows=selected_rows,
-                frame_rows=frame_rows,
-                frames_raw_dir=paths.frames_raw_dir,
-                strategy="fsm_group",
-                min_gap_sec=15.0,
-                max_rounds=2,
-                ocr_texts=ocr_texts,
-            )
-        refill_meta["gap_refill_mode"] = gap_refill_mode
+        selected_orig, selected_rows, confidence_refilled = _refill_gaps(
+            selected_orig=selected_orig,
+            selected_rows=selected_rows,
+            frame_rows=frame_rows,
+            frames_raw_dir=paths.frames_raw_dir,
+            strategy="fsm_group",
+            min_gap_sec=15.0,
+            max_rounds=2,
+            ocr_texts=ocr_texts,
+        )
+        refill_meta["gap_refill_mode"] = "confidence"
         refill_meta["confidence_refilled_pages"] = confidence_refilled
         selected_orig, selected_rows, merged_close_pairs = _cleanup_close_pairs(
             selected_orig=selected_orig,
@@ -899,7 +900,7 @@ def run_pipeline(
         manifest.metadata["dedupe"]["completed_pages"] = int(refill_meta.get("completed_pages", 0))
         manifest.metadata["dedupe"]["complete_mode"] = str(refill_meta.get("complete_mode", "iterative"))
         manifest.metadata["dedupe"]["fsm_collapsed_pages"] = int(refill_meta.get("fsm_collapsed_pages", 0))
-        manifest.metadata["dedupe"]["gap_refill_mode"] = str(refill_meta.get("gap_refill_mode", "none"))
+        manifest.metadata["dedupe"]["gap_refill_mode"] = str(refill_meta.get("gap_refill_mode", "confidence"))
         manifest.metadata["dedupe"]["confidence_refilled_pages"] = int(refill_meta.get("confidence_refilled_pages", 0))
         manifest.metadata["dedupe"]["merged_close_pairs"] = int(refill_meta.get("merged_close_pairs", 0))
 
@@ -980,9 +981,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_cmd.add_argument(
         "--gap-refill-mode",
-        choices=["none", "confidence"],
-        default="none",
-        help="optional post-FSM adaptive refill mode for wide low-confidence gaps",
+        choices=["confidence"],
+        default="confidence",
+        help="post-FSM adaptive refill mode (confidence only)",
     )
     run_cmd.add_argument(
         "--expected-pages",
