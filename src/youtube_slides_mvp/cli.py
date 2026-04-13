@@ -386,7 +386,20 @@ def _refill_gaps(
                 best_score = -1.0
                 best_row: dict[str, int | float | str] | None = None
                 for cp, row in sampled:
-                    score = min(_diff(fc.get(cp), a_left), _diff(fc.get(cp), a_right))
+                    arr = fc.get(cp)
+                    d_l = _diff(arr, a_left)
+                    d_r = _diff(arr, a_right)
+                    # Endpoint proximity pruning: skip candidates too
+                    # close to either endpoint (borderline intermediates).
+                    if d_l <= ep_prune_diff:
+                        neg_l, _ = _directional_change(a_left, arr)
+                        if neg_l <= ep_prune_neg:
+                            continue
+                    if d_r <= ep_prune_diff:
+                        neg_r, _ = _directional_change(arr, a_right)
+                        if neg_r <= ep_prune_neg:
+                            continue
+                    score = min(d_l, d_r)
                     if score > best_score:
                         best_score = score
                         best_row = row
@@ -497,15 +510,17 @@ def _complete_pages(
     fsm_max_diff: float = 0.10,
     ocr_texts: dict[str, str] | None = None,
 ) -> tuple[list[Path], list[dict[str, int | float | str]], int, int, int]:
-    """Replace each selected page with its most-complete reveal state, then
-    collapse any remaining adjacent progressive-reveal pairs and drop blank
-    transition frames.
+    """Collapse adjacent progressive-reveal pairs, drop blank transition frames,
+    then replace each surviving page with its most-complete reveal state.
+
+    The FSM collapse runs BEFORE completion so that Phase 1 completions cannot
+    create additive bridges across genuine slide boundaries.
 
     Returns (out_orig, out_rows, completed, collapsed, dropped_blank).
     """
     fc = FrameCache()
 
-    # Phase 0: drop blank transition frames before the completion pass.
+    # Phase 0: drop blank transition frames.
     pre_orig: list[Path] = []
     pre_rows: list[dict[str, int | float | str]] = []
     dropped_blank = 0
@@ -519,13 +534,59 @@ def _complete_pages(
     if not pre_orig:
         return [], [], 0, 0, dropped_blank
 
-    # Freeze original neighbors so one page's replacement does not affect
-    # another page's completion window.
-    base_orig = list(pre_orig)
-    base_rows = [dict(r) for r in pre_rows]
+    # Phase 1 (formerly Phase 2): FSM-style additive-pair collapse.
+    # Runs on raw, pre-completion frames so that completion cannot create
+    # false additive bridges (e.g. 991→1005→1024 chain).
+    valid = sorted(zip(pre_orig, pre_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
+    fsm_out: list[tuple[Path, dict[str, int | float | str]]] = []
+    collapsed = 0
+    if valid:
+        cand_p, cand_r = valid[0]
+        cand_a = fc.get(cand_p)
+        for cur_p, cur_r in valid[1:]:
+            cur_a = fc.get(cur_p)
+            # OCR first-priority: text prefix → progressive, disjoint words → not additive.
+            if ocr_texts is not None:
+                ocr_v = compare_text_prefix(
+                    ocr_texts.get(cand_p.name, ""), ocr_texts.get(cur_p.name, "")
+                )
+            else:
+                ocr_v = "unknown"
+            if ocr_v == "different":
+                additive_only = False
+            elif ocr_v == "progressive":
+                additive_only = True
+            else:
+                d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
+                neg, _pos = _directional_change(cand_a, cur_a)
+                dc, da = _dark_cover(cand_a, cur_a)
+                # Tier A: small-delta progressive
+                tier_a = (
+                    d <= fsm_max_diff
+                    and neg <= fsm_max_neg
+                    and dc >= fsm_min_dark_cover
+                    and da <= fsm_max_dark_add
+                )
+                # Tier B: large-delta progressive (heavy addition, near-zero removal)
+                tier_b = neg <= 0.005 and dc >= 0.90 and da <= 0.10
+                additive_only = tier_a or tier_b
+            if additive_only:
+                cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
+                collapsed += 1
+            else:
+                fsm_out.append((cand_p, cand_r))
+                cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
+        fsm_out.append((cand_p, cand_r))
 
-    out_orig = list(pre_orig)
-    out_rows = [dict(r) for r in pre_rows]
+    if not fsm_out:
+        return [], [], 0, collapsed, dropped_blank
+
+    # Phase 2 (formerly Phase 1): completion — advance each surviving page
+    # to its most-complete reveal state.
+    base_orig = [p for p, _ in fsm_out]
+    base_rows = [dict(r) for _, r in fsm_out]
+    out_orig = list(base_orig)
+    out_rows = [dict(r) for r in base_rows]
     completed = 0
 
     for i, (page_path, page_row) in enumerate(zip(base_orig, base_rows)):
@@ -600,18 +661,29 @@ def _complete_pages(
             out_rows[i]["page"] = page_row["page"]
             completed += 1
 
-    # Phase 2: FSM-style additive-pair collapse.
-    # Walk in timeline order; when two adjacent pages are in a progressive-reveal
-    # (additive) relationship, keep the later (more complete) one.
-    valid = sorted(zip(out_orig, out_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
-    fsm_out: list[tuple[Path, dict[str, int | float | str]]] = []
-    collapsed = 0
-    if valid:
-        cand_p, cand_r = valid[0]
+    # Track which frames were modified by completion — used to guard
+    # the post-completion FSM against collapsing unmodified pre-FSM
+    # survivors whose adjacency was created by the pre-completion FSM
+    # (not by a genuine progressive-reveal bridge).
+    completed_names: set[str] = set()
+    for i in range(len(out_orig)):
+        if out_orig[i].name != base_orig[i].name:
+            completed_names.add(out_orig[i].name)
+
+    # Phase 3: post-completion FSM pass.
+    # Only collapse a pair when the candidate (the frame that would be
+    # dropped) was modified by completion.  Pre-FSM survivors that became
+    # adjacent only because the pre-completion FSM removed intermediates
+    # are preserved — they represent content-distinct slides that the
+    # pre-FSM already validated.
+    valid2 = sorted(zip(out_orig, out_rows), key=lambda it: float(it[1].get("timestamp_sec", 0.0)))
+    fsm2_out: list[tuple[Path, dict[str, int | float | str]]] = []
+    collapsed2 = 0
+    if valid2:
+        cand_p, cand_r = valid2[0]
         cand_a = fc.get(cand_p)
-        for cur_p, cur_r in valid[1:]:
+        for cur_p, cur_r in valid2[1:]:
             cur_a = fc.get(cur_p)
-            # OCR first-priority: text prefix → progressive, disjoint words → not additive.
             if ocr_texts is not None:
                 ocr_v = compare_text_prefix(
                     ocr_texts.get(cand_p.name, ""), ocr_texts.get(cur_p.name, "")
@@ -626,26 +698,27 @@ def _complete_pages(
                 d = float(np.mean(np.abs(cand_a.astype(np.float32) - cur_a.astype(np.float32))) / 255.0)
                 neg, _pos = _directional_change(cand_a, cur_a)
                 dc, da = _dark_cover(cand_a, cur_a)
-                # Tier A: small-delta progressive
                 tier_a = (
                     d <= fsm_max_diff
                     and neg <= fsm_max_neg
                     and dc >= fsm_min_dark_cover
                     and da <= fsm_max_dark_add
                 )
-                # Tier B: large-delta progressive (heavy addition, near-zero removal)
                 tier_b = neg <= 0.005 and dc >= 0.90 and da <= 0.10
                 additive_only = tier_a or tier_b
-            if additive_only:
+            # Guard: only drop the candidate if it was modified by
+            # completion.  Unmodified pre-FSM survivors stay.
+            if additive_only and cand_p.name in completed_names:
                 cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
-                collapsed += 1
+                collapsed2 += 1
             else:
-                fsm_out.append((cand_p, cand_r))
+                fsm2_out.append((cand_p, cand_r))
                 cand_p, cand_r, cand_a = cur_p, dict(cur_r), cur_a
-        fsm_out.append((cand_p, cand_r))
+        fsm2_out.append((cand_p, cand_r))
+    collapsed += collapsed2
 
-    final_orig = [p for p, _ in fsm_out]
-    final_rows = [dict(r) for _, r in fsm_out]
+    final_orig = [p for p, _ in fsm2_out]
+    final_rows = [dict(r) for _, r in fsm2_out]
     for page, row in enumerate(final_rows, start=1):
         row["page"] = page
     return final_orig, final_rows, completed, collapsed, dropped_blank
@@ -1027,7 +1100,6 @@ def run_pipeline(
             frame_rows=frame_rows,
             frames_raw_dir=paths.frames_raw_dir,
             strategy="novelty",
-            min_gap_sec=15.0,
             ocr_texts=ocr_texts,
         )
         refill_meta["rescued_gap_pages"] = rescued_gap
