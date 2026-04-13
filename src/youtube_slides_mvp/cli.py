@@ -1027,6 +1027,7 @@ def run_pipeline(
             frame_rows=frame_rows,
             frames_raw_dir=paths.frames_raw_dir,
             strategy="novelty",
+            min_gap_sec=15.0,
             ocr_texts=ocr_texts,
         )
         refill_meta["rescued_gap_pages"] = rescued_gap

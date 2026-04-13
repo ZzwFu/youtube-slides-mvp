@@ -125,6 +125,7 @@ def main() -> int:
         frame_rows=frame_rows,
         frames_raw_dir=paths.frames_raw_dir,
         strategy="novelty",
+        min_gap_sec=15.0,
     )
     print(f"  Rescued gap pages: {rescued_gap}")
 
