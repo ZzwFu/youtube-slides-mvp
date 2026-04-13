@@ -99,12 +99,17 @@ Each run creates:
 ## Evaluation
 
 ```bash
-# Compare a run against the golden benchmark:
+# First-time setup: promote a manually approved run into a reusable benchmark:
+python scripts/create_benchmark.py slide-20260409-022438 slide-20260409-022438
+
+# Compare a run against the approved benchmark:
 python scripts/eval_run.py slide-20260409-HHMMSS
 
 # Re-run D3-D10 on existing frames with different settings:
 python scripts/rerun_d3_d10.py slide-20260409-022438 iterative confidence
 ```
+
+`eval_run.py` writes `artifacts/benchmark_eval.json` and `artifacts/benchmark_eval.md` so later regressions can be checked automatically.
 
 
 ## Output layout
@@ -119,6 +124,8 @@ Each run creates:
 - `runs/<task_id>/artifacts/mask_profile.json`
 - `runs/<task_id>/artifacts/ocr_report.json`
 - `runs/<task_id>/artifacts/slides.json`
+- `runs/<task_id>/artifacts/benchmark_eval.json`
+- `runs/<task_id>/artifacts/benchmark_eval.md`
 - `runs/<task_id>/artifacts/quality_report.json`
 - `runs/<task_id>/artifacts/quality_report.md`
 - `runs/<task_id>/pdf/`

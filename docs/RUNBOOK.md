@@ -51,14 +51,19 @@ When `--expected-pages` is not provided, gate is `unknown` and `gate_pass=false`
 ## Evaluation
 
 ```bash
-# Compare a finished run against golden benchmark (expected_pages=68):
+# One-time benchmark creation from a manually approved run:
+python scripts/create_benchmark.py slide-20260409-022438 slide-20260409-022438
+
+# Compare a finished run against the approved benchmark:
 python scripts/eval_run.py slide-20260409-HHMMSS
 
 # Supply explicit benchmark if source_run differs:
 python scripts/eval_run.py slide-20260409-HHMMSS slide-20260409-022438
 ```
 
-Exit code 0 = gate pass, 1 = gate fail, 2 = usage error.
+`eval_run.py` refreshes `artifacts/benchmark_eval.json` and `artifacts/benchmark_eval.md` in the evaluated run directory.
+
+Exit code 0 = gate pass, 1 = gate fail or benchmark missing, 2 = usage error.
 
 ## Re-run D3-D10 on existing frames
 
@@ -70,6 +75,7 @@ python scripts/rerun_d3_d10.py slide-20260409-022438 iterative confidence
 ```
 
 Outputs `runs/<new_id>/artifacts/experiment_log.json` with page_count and quality metrics.
+If a benchmark exists for `<source_run_id>`, the rerun also writes `benchmark_eval.json` and `benchmark_eval.md` automatically.
 
 ## Training the pair classifier (Card 4.3)
 
@@ -91,6 +97,8 @@ python scripts/train_classifier.py --sidecar "runs/*/artifacts/sidecar.json"
 - `manifest.json`
 - `artifacts/frame_manifest.json`
 - `artifacts/slides.json`
+- `artifacts/benchmark_eval.json`
+- `artifacts/benchmark_eval.md`
 - `artifacts/quality_report.json`
 - `pdf/slides.pdf`
 - `pdf/slides_with_index.pdf`

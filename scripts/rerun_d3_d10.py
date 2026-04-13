@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from youtube_slides_mvp.benchmark import evaluate_run_directory, write_benchmark_evaluation, write_benchmark_evaluation_markdown
 from youtube_slides_mvp.dedupe import DedupeConfig, dedupe_frames
 from youtube_slides_mvp.manifest import build_task_paths, ensure_task_dirs, make_task_id, write_manifest
 from youtube_slides_mvp.models import TaskManifest, TaskStatus
@@ -178,11 +179,35 @@ def main() -> int:
         "raw_frame_count": len(raw_frames),
     }
 
+    benchmark_report = evaluate_run_directory(paths.task_dir, benchmark_id=src_id)
+    benchmark_json = paths.artifacts_dir / "benchmark_eval.json"
+    benchmark_md = paths.artifacts_dir / "benchmark_eval.md"
+    write_benchmark_evaluation(benchmark_json, benchmark_report)
+    write_benchmark_evaluation_markdown(benchmark_md, benchmark_report)
+    manifest.metadata["benchmark_eval"] = {
+        "benchmark_id": benchmark_report.get("benchmark_id"),
+        "comparison_mode": benchmark_report.get("comparison_mode"),
+        "gate": benchmark_report.get("gate"),
+        "gate_pass": benchmark_report.get("gate_pass"),
+        "precision": benchmark_report.get("precision"),
+        "recall": benchmark_report.get("recall"),
+        "f1": benchmark_report.get("f1"),
+        "miss_rate": benchmark_report.get("miss_rate"),
+        "excess_rate": benchmark_report.get("excess_rate"),
+        "missing_count": benchmark_report.get("missing_count"),
+        "extra_count": benchmark_report.get("extra_count"),
+        "report_json": str(benchmark_json),
+        "report_md": str(benchmark_md),
+        "reason": benchmark_report.get("reason"),
+    }
+    print(f"  Benchmark eval: {benchmark_report.get('gate', 'unknown').upper()}  mode={benchmark_report.get('comparison_mode')}")
+
     # ── D9 Quality ───────────────────────────────────────────────────────────
     qmetrics = compute_quality_metrics(
         raw_count=len(raw_frames),
         selected_count=len(selected_orig),
         suspect_windows=0,  # no OCR in this script
+        expected_pages=benchmark_report.get("expected_pages") if benchmark_report.get("expected_pages") is not None else None,
     )
     gated = evaluate_gate(qmetrics)
     write_quality_report(paths.artifacts_dir / "quality_report.json", gated)
@@ -206,6 +231,20 @@ def main() -> int:
         "page_count": len(selected_orig),
         "raw_frame_count": len(raw_frames),
         "quality": {k: v for k, v in gated.items()},
+        "benchmark_eval": {
+            "benchmark_id": benchmark_report.get("benchmark_id"),
+            "comparison_mode": benchmark_report.get("comparison_mode"),
+            "gate": benchmark_report.get("gate"),
+            "precision": benchmark_report.get("precision"),
+            "recall": benchmark_report.get("recall"),
+            "f1": benchmark_report.get("f1"),
+            "miss_rate": benchmark_report.get("miss_rate"),
+            "excess_rate": benchmark_report.get("excess_rate"),
+        },
+        "diff_vs_baseline": {
+            "missing_pages": benchmark_report.get("missing_pages", []),
+            "extra_pages": benchmark_report.get("extra_pages", []),
+        },
     }
     exp_log_path = paths.artifacts_dir / "experiment_log.json"
     exp_log_path.write_text(json.dumps(experiment_log, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
