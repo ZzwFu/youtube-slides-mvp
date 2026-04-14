@@ -6,4 +6,4 @@ __pycache__/
 *project*history*
 benchmark*
 .DS_Store
-.vscode/
+.vscode/benchmarks/
