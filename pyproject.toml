@@ -20,3 +20,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.scripts]
+pdfpages = "youtube_slides_mvp.pdfpages_cli:main"

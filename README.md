@@ -76,6 +76,55 @@ Key optional flags:
 | `--refill-multiplier` | `2.5` | D7 re-extraction FPS multiplier |
 | `--max-refill-windows` | `0` | Max suspect windows to re-extract (`0` disables D7 refill) |
 
+
+## PDF Page Editing
+
+### Installation
+
+1. **本地开发环境安装**（推荐，支持命令行直接调用）：
+
+```bash
+# 进入项目根目录
+pip install .
+# 或者开发模式安装（自动追踪源码变动）
+pip install -e .
+```
+
+2. **依赖要求**：需已安装 Python 3.10+，并确保 requirements.txt 依赖已装好（如 PyMuPDF/fitz）。
+
+3. **安装后，命令行可直接使用 `pdfpages`：**
+
+```bash
+pdfpages slides.pdf --delete 2,5-8,12 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --insert 5,7-9,13 --after 3 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --replace 3,7:4,8 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --delete 2,5-8,12 --insert 5,7-9,13 --after 3 --replace 3,7:4,8 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --insert 2 --after 1 --insert 4-5 --after 3 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --insert @00:12:34-@00:12:50 --after 17 -o slides-1.pdf --from-run runs/<task>
+pdfpages slides.pdf --replace 12:@754.5s -o slides-1.pdf --from-run runs/<task>
+```
+
+如未安装到全局，可用如下方式临时调用：
+
+```bash
+PYTHONPATH=src python -m youtube_slides_mvp.pdfpages_cli slides.pdf --delete 2,5-8,12 -o slides-1.pdf --from slides_raw.pdf
+```
+
+`--insert` 可以重复出现，每一条都必须紧跟一个 `--after`，例如 `--insert 2 --after 1 --insert 4-5 --after 3`。
+`--insert` 和 `--replace` 的 source 侧现在也支持 `@时间` 语法，例如 `@754.5s`、`@12:34`、`@01:02:03.500`、`@12:34-@12:50`。`--from-run` 可以直接给 `runs/<task>/` 目录，CLI 会自动找到源 PDF 和时间索引；如果不传 `--from-run`，它会从当前 input PDF 所在目录向上查找同样的 run 上下文。
+
+### Range syntax
+
+- `3` means page 3.
+- `3-7` means pages 3 through 7.
+- `3,5,7` means pages 3, 5, and 7.
+- `5-` means page 5 through the last page.
+- `-5` means the first 5 pages.
+- `1,3-5,8-` combines forms.
+- `last` or `-1` means the last page.
+
+组合操作时，所有页码都按原始输入 PDF 解释，不会随着前一个操作的输出重新编号。`--delete` 和 `--replace` 直接命中原始页号，`--insert --after N` 里的 `N` 也是原始页边界。
+
 ## Output layout
 
 Each run creates:

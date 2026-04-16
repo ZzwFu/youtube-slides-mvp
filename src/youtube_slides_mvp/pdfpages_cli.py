@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -71,36 +72,124 @@ def _parse_edit_tokens(tokens: Sequence[str]) -> tuple[str | None, list[tuple[st
     return delete_spec, insert_ops, replace_spec
 
 
+def _uses_time_source_specs(insert_ops: list[tuple[str, int]], replace_spec: str | None) -> bool:
+    if any("@" in insert_spec for insert_spec, _ in insert_ops):
+        return True
+    if replace_spec is None or ":" not in replace_spec:
+        return False
+    return "@" in replace_spec.split(":", 1)[1]
+
+
+def _load_source_rows(index_path: Path) -> list[dict[str, int | float | str]]:
+    if not index_path.is_file():
+        raise ValueError(f"source index not found: {index_path}")
+
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"unsupported source index format: {index_path}")
+
+    rows = payload.get("frames")
+    if rows is None:
+        rows = payload.get("slides")
+    if not isinstance(rows, list):
+        raise ValueError(f"unsupported source index format: {index_path}")
+
+    normalized: list[dict[str, int | float | str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"unsupported source index row in {index_path}")
+        normalized.append(dict(row))
+
+    return normalized
+
+
+def _find_run_root_from_context(input_pdf: Path) -> Path | None:
+    resolved_input = input_pdf.resolve()
+    for candidate in resolved_input.parents:
+        if not candidate.is_dir():
+            continue
+
+        manifest_path = candidate / "manifest.json"
+        raw_pdf = candidate / "pdf" / "slides_raw.pdf"
+        raw_index = candidate / "artifacts" / "frame_manifest.json"
+        if manifest_path.is_file() and raw_pdf.is_file() and raw_index.is_file():
+            return candidate
+
+        slides_pdf = candidate / "pdf" / "slides.pdf"
+        slides_index = candidate / "artifacts" / "slides.json"
+        if manifest_path.is_file() and slides_pdf.is_file() and slides_index.is_file():
+            return candidate
+
+    return None
+
+
+def _resolve_run_source_context(
+    run_root: Path,
+    source_pdf: Path | None = None,
+) -> tuple[Path, list[dict[str, int | float | str]]]:
+    raw_pdf = run_root / "pdf" / "slides_raw.pdf"
+    raw_index = run_root / "artifacts" / "frame_manifest.json"
+    slides_pdf = run_root / "pdf" / "slides.pdf"
+    slides_index = run_root / "artifacts" / "slides.json"
+
+    if source_pdf is None:
+        if raw_pdf.is_file() and raw_index.is_file():
+            return raw_pdf, _load_source_rows(raw_index)
+        if slides_pdf.is_file() and slides_index.is_file():
+            return slides_pdf, _load_source_rows(slides_index)
+        raise ValueError(f"unable to resolve a source PDF and index under run directory: {run_root}")
+
+    if source_pdf.name == "slides_raw.pdf":
+        if not raw_index.is_file():
+            raise ValueError(f"missing frame manifest for {source_pdf.name} under run directory: {run_root}")
+        return source_pdf, _load_source_rows(raw_index)
+
+    if source_pdf.name == "slides.pdf":
+        if not slides_index.is_file():
+            raise ValueError(f"missing slide index for {source_pdf.name} under run directory: {run_root}")
+        return source_pdf, _load_source_rows(slides_index)
+
+    raise ValueError("time-based source specs require a source PDF named slides_raw.pdf or slides.pdf")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pdfpages",
         description=(
             "Flexible PDF page editing: delete, insert, and replace can be combined in a single command. "
-            "All page specs and insert positions are interpreted against the original input PDF (not renumbered after edits).\n\n"
+            "Page specs stay numeric, and source specs may also use @timestamp syntax to reference source pages by video time. "
+            "All target page numbers and insert positions are interpreted against the original input PDF (not renumbered after edits).\n\n"
             "Multiple --insert operations are supported: each --insert <pages> must be immediately followed by --after <N>. "
-            "All insertions are applied in the order given."
+            "When time-based source specs are used, the CLI can load the source PDF and its index from --from-run or by walking up from the input PDF directory."
         ),
         epilog=(
-            "\nUsage patterns for multiple insertions:\n"
-            "  pdfpages input.pdf --insert 2 --after 1 --insert 4-5 --after 3 -o out.pdf --from raw.pdf\n"
-            "  pdfpages input.pdf --delete 2,5-8 --insert 5,7-9 --after 3 -o out.pdf --from raw.pdf\n"
-            "  pdfpages input.pdf --insert 2 --after 1 --insert 4-5 --after 3 --replace 7:8 -o out.pdf --from raw.pdf\n"
-            "\nEach --insert <pages> must be paired with a following --after <N>. "
-            "All page numbers and after-positions refer to the original input PDF.\n"
-            "\nPage spec syntax:\n"
-            "  3         # page 3\n"
-            "  3-7       # pages 3 through 7\n"
-            "  3,5,7     # pages 3, 5, and 7\n"
-            "  5-        # page 5 through last\n"
-            "  -5        # first 5 pages\n"
-            "  last, -1  # last page\n"
-            "  1,3-5,8-  # combine forms\n"
+            "\nExamples:\n"
+            "  pdfpages runs/<task>/pdf/slides.pdf --insert @00:12:34-@00:12:50 --after 17 -o out.pdf\n"
+            "  pdfpages input.pdf --replace 12:@754.5s -o out.pdf --from-run runs/<task>\n"
+            "  pdfpages input.pdf --delete 2,5-8 --insert 5,7-9 --after 3 --replace 3,7:4,8 -o out.pdf --from slides_raw.pdf\n"
+            "\nTime syntax examples:\n"
+            "  @754.5s\n"
+            "  @12:34\n"
+            "  @01:02:03.500\n"
+            "  @12:34-@12:50\n"
+            "\nIf --from-run is omitted, the CLI looks for a run layout in the input PDF's parent directories."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input_pdf", type=Path, help="input PDF to modify")
 
-    parser.add_argument("--from", dest="source_pdf", type=Path, help="source PDF for insert/replace")
+    parser.add_argument(
+        "--from",
+        dest="source_pdf",
+        type=Path,
+        help="source PDF for insert/replace; optional when time-based source specs are resolved from --from-run or local run context",
+    )
+    parser.add_argument(
+        "--from-run",
+        dest="source_run",
+        type=Path,
+        help="run directory (for example runs/<task>) used to auto-locate the source PDF and time index",
+    )
     parser.add_argument("-o", "--output", required=True, type=Path, help="output PDF path")
     return parser
 
@@ -115,13 +204,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         delete_spec, insert_ops, replace_spec = _parse_edit_tokens(edit_tokens)
 
-        if (insert_ops or replace_spec is not None) and args.source_pdf is None:
-            parser.error("--from is required with --insert or --replace")
+        source_pdf = args.source_pdf
+        source_rows: list[dict[str, int | float | str]] | None = None
+        uses_time_specs = _uses_time_source_specs(insert_ops, replace_spec)
+
+        if uses_time_specs:
+            run_root = args.source_run or _find_run_root_from_context(args.input_pdf)
+            if run_root is None:
+                parser.error("time-based source specs require --from-run or a PDF inside a run directory")
+            source_pdf, source_rows = _resolve_run_source_context(run_root, source_pdf)
+        elif (insert_ops or replace_spec is not None) and source_pdf is None:
+            if args.source_run is not None:
+                source_pdf, _ = _resolve_run_source_context(args.source_run, None)
+            else:
+                parser.error("--from is required with --insert or --replace")
 
         edit_pdf_pages(
             args.input_pdf,
             args.output,
-            source_pdf=args.source_pdf,
+            source_pdf=source_pdf,
+            source_rows=source_rows,
             delete_spec=delete_spec,
             insert_ops=insert_ops,
             replace_spec=replace_spec,
