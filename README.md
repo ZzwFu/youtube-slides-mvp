@@ -97,11 +97,11 @@ pip install -e .
 ```bash
 pdfpages slides.pdf --delete 2,5-8,12 -o slides-1.pdf --from slides_raw.pdf
 pdfpages slides.pdf --insert 5,7-9,13 --after 3 -o slides-1.pdf --from slides_raw.pdf
-pdfpages slides.pdf --replace 3,7:4,8 -o slides-1.pdf --from slides_raw.pdf
-pdfpages slides.pdf --delete 2,5-8,12 --insert 5,7-9,13 --after 3 --replace 3,7:4,8 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --replace 3,7=4,8 -o slides-1.pdf --from slides_raw.pdf
+pdfpages slides.pdf --delete 2,5-8,12 --insert 5,7-9,13 --after 3 --replace 3,7=4,8 -o slides-1.pdf --from slides_raw.pdf
 pdfpages slides.pdf --insert 2 --after 1 --insert 4-5 --after 3 -o slides-1.pdf --from slides_raw.pdf
-pdfpages slides.pdf --insert @00:12:34-@00:12:50 --after 17 -o slides-1.pdf --from-run runs/<task>
-pdfpages slides.pdf --replace 12:@754.5s -o slides-1.pdf --from-run runs/<task>
+pdfpages slides.pdf --insert 2,@00:12:34,4-5 --after 17 -o slides-1.pdf --from-run runs/<task>
+pdfpages slides.pdf --replace 12,13=4,@754.5s -o slides-1.pdf --from-run runs/<task>
 ```
 
 如未安装到全局，可用如下方式临时调用：
@@ -111,7 +111,7 @@ PYTHONPATH=src python -m youtube_slides_mvp.pdfpages_cli slides.pdf --delete 2,5
 ```
 
 `--insert` 可以重复出现，每一条都必须紧跟一个 `--after`，例如 `--insert 2 --after 1 --insert 4-5 --after 3`。
-`--insert` 和 `--replace` 的 source 侧现在也支持 `@时间` 语法，例如 `@754.5s`、`@12:34`、`@01:02:03.500`、`@12:34-@12:50`。`--from-run` 可以直接给 `runs/<task>/` 目录，CLI 会自动找到源 PDF 和时间索引；如果不传 `--from-run`，它会从当前 input PDF 所在目录向上查找同样的 run 上下文。
+`--insert` 和 `--replace` 的 source 侧现在也支持 `@时间` 语法，并且可以和页码 token 混写，例如 `2,@00:12:34,4-5` 或 `1,@754.5s`。`--replace` 使用 `TARGET=SOURCE`，因此不需要额外引号；例如 `12,13=4,@754.5s`。两边展开后的页数必须一致。`--from-run` 可以直接给 `runs/<task>/` 目录，CLI 会自动找到源 PDF 和时间索引；如果不传 `--from-run`，它会从当前 input PDF 所在目录向上查找同样的 run 上下文。
 
 ### Range syntax
 

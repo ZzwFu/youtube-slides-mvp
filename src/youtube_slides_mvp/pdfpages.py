@@ -150,6 +150,19 @@ def _time_index_for_timestamp(timestamp: float, timestamps: Sequence[float]) -> 
     return index
 
 
+def _split_replace_spec(replace_spec: str) -> tuple[str, str, str]:
+    for separator in ("=", ">", ":"):
+        if separator not in replace_spec:
+            continue
+
+        target_spec, source_spec = replace_spec.split(separator, 1)
+        if not target_spec or not source_spec:
+            break
+        return separator, target_spec, source_spec
+
+    raise ValueError("--replace must use TARGET=SOURCE page lists")
+
+
 def expand_page_spec(spec: str, total_pages: int) -> list[int]:
     """Expand a flexible page specification into 1-based page numbers.
 
@@ -202,51 +215,42 @@ def expand_page_spec(spec: str, total_pages: int) -> list[int]:
     return pages
 
 
-def _expand_time_spec(spec: str, source_rows: Sequence[dict[str, int | float | str]]) -> list[int]:
-    page_numbers, timestamps = _build_time_index(source_rows)
-    cleaned = _normalize_source_spec(spec)
-    pages: list[int] = []
+def _expand_time_token(
+    raw_token: str,
+    page_numbers: Sequence[int],
+    timestamps: Sequence[float],
+) -> list[int]:
+    if raw_token.startswith("-@"):
+        end_time = _parse_time_seconds(raw_token[1:])
+        end_index = _time_index_for_timestamp(end_time, timestamps)
+        return list(page_numbers[: end_index + 1])
 
-    for raw_token in cleaned.split(","):
-        if not raw_token:
-            raise ValueError(f"invalid source specification: {spec!r}")
-
-        if raw_token.startswith("-@"): 
-            end_time = _parse_time_seconds(raw_token[1:])
-            end_index = _time_index_for_timestamp(end_time, timestamps)
-            pages.extend(page_numbers[: end_index + 1])
-            continue
-
-        if raw_token.endswith("-") and raw_token != "-":
-            start_token = raw_token[:-1]
-            if not start_token.startswith("@"):
-                raise ValueError("time-based source specs must use @ timestamps")
-            start_time = _parse_time_seconds(start_token)
-            start_index = _time_index_for_timestamp(start_time, timestamps)
-            pages.extend(page_numbers[start_index:])
-            continue
-
-        if raw_token.count("-") == 1:
-            left, right = raw_token.split("-", 1)
-            if not left.startswith("@") or not right.startswith("@"):
-                raise ValueError("time-based source specs must use @ timestamps")
-            start_time = _parse_time_seconds(left)
-            end_time = _parse_time_seconds(right)
-            if start_time > end_time:
-                raise ValueError(f"invalid time range {raw_token!r}: start exceeds end")
-            start_index = _time_index_for_timestamp(start_time, timestamps)
-            end_index = _time_index_for_timestamp(end_time, timestamps)
-            pages.extend(page_numbers[start_index : end_index + 1])
-            continue
-
-        if not raw_token.startswith("@"):
+    if raw_token.endswith("-") and raw_token != "-":
+        start_token = raw_token[:-1]
+        if not start_token.startswith("@"): 
             raise ValueError("time-based source specs must use @ timestamps")
+        start_time = _parse_time_seconds(start_token)
+        start_index = _time_index_for_timestamp(start_time, timestamps)
+        return list(page_numbers[start_index:])
 
-        point_time = _parse_time_seconds(raw_token)
-        point_index = _time_index_for_timestamp(point_time, timestamps)
-        pages.append(page_numbers[point_index])
+    if raw_token.count("-") == 1:
+        left, right = raw_token.split("-", 1)
+        if not left.startswith("@") or not right.startswith("@"): 
+            raise ValueError("time-based source specs must use @ timestamps")
+        start_time = _parse_time_seconds(left)
+        end_time = _parse_time_seconds(right)
+        if start_time > end_time:
+            raise ValueError(f"invalid time range {raw_token!r}: start exceeds end")
+        start_index = _time_index_for_timestamp(start_time, timestamps)
+        end_index = _time_index_for_timestamp(end_time, timestamps)
+        return list(page_numbers[start_index : end_index + 1])
 
-    return pages
+    if not raw_token.startswith("@"): 
+        raise ValueError("time-based source specs must use @ timestamps")
+
+    point_time = _parse_time_seconds(raw_token)
+    point_index = _time_index_for_timestamp(point_time, timestamps)
+    return [page_numbers[point_index]]
 
 
 def _expand_source_spec(
@@ -254,11 +258,26 @@ def _expand_source_spec(
     source_page_count: int,
     source_rows: Sequence[dict[str, int | float | str]] | None = None,
 ) -> list[int]:
-    if "@" in spec:
-        if source_rows is None:
-            raise ValueError("time-based source specs require source index data")
-        return _expand_time_spec(spec, source_rows)
-    return expand_page_spec(spec, source_page_count)
+    cleaned = _normalize_source_spec(spec)
+    pages: list[int] = []
+    time_index: tuple[list[int], list[float]] | None = None
+
+    for raw_token in cleaned.split(","):
+        if not raw_token:
+            raise ValueError(f"invalid source specification: {spec!r}")
+
+        if "@" in raw_token:
+            if source_rows is None:
+                raise ValueError("time-based source specs require source index data")
+            if time_index is None:
+                time_index = _build_time_index(source_rows)
+            page_numbers, timestamps = time_index
+            pages.extend(_expand_time_token(raw_token, page_numbers, timestamps))
+            continue
+
+        pages.extend(expand_page_spec(raw_token, source_page_count))
+
+    return pages
 
 
 def _open_pdf(path: Path) -> fitz.Document:
@@ -293,12 +312,7 @@ def _parse_replace_spec(
     source_page_count: int,
     source_rows: Sequence[dict[str, int | float | str]] | None = None,
 ) -> dict[int, int]:
-    if ":" not in replace_spec:
-        raise ValueError("--replace must use TARGET:SOURCE page lists")
-
-    target_spec, source_spec = replace_spec.split(":", 1)
-    if not target_spec or not source_spec:
-        raise ValueError("--replace must use TARGET:SOURCE page lists")
+    _, target_spec, source_spec = _split_replace_spec(replace_spec)
 
     target_pages = expand_page_spec(target_spec, input_page_count)
     if len(set(target_pages)) != len(target_pages):

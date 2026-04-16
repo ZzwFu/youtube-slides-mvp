@@ -10,6 +10,7 @@ from src.youtube_slides_mvp.pdfpages_cli import main
 
 
 def _make_pdf(path: Path, labels: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     doc = fitz.open()
     try:
         for label in labels:
@@ -149,7 +150,7 @@ def test_pdfpages_replace(tmp_path: Path) -> None:
     exit_code = main([
         str(input_pdf),
         "--replace",
-        "3,7:4,8",
+        "3,7=4,8",
         "-o",
         str(output_pdf),
         "--from",
@@ -169,18 +170,18 @@ def test_pdfpages_replace(tmp_path: Path) -> None:
     ]
 
 
-def test_pdfpages_time_based_insert_falls_back_to_input_pdf_context(tmp_path: Path) -> None:
+def test_pdfpages_mixed_source_insert_falls_back_to_input_pdf_context(tmp_path: Path) -> None:
     run_dir = tmp_path / "runs" / "slide-001"
     input_pdf = run_dir / "pdf" / "slides.pdf"
     output_pdf = tmp_path / "slides_out.pdf"
 
     _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 4)])
-    _make_run_context(run_dir, [f"source {idx}" for idx in range(1, 5)], [0.0, 1.0, 2.0, 3.0])
+    _make_run_context(run_dir, [f"source {idx}" for idx in range(1, 6)], [0.0, 1.0, 2.0, 3.0, 4.0])
 
     exit_code = main([
         str(input_pdf),
         "--insert",
-        "@1.2-@2.4",
+        "2,@1.2,4-5",
         "--after",
         "1",
         "-o",
@@ -191,24 +192,26 @@ def test_pdfpages_time_based_insert_falls_back_to_input_pdf_context(tmp_path: Pa
     assert _read_pdf_texts(output_pdf) == [
         "input 1",
         "source 2",
-        "source 3",
+        "source 2",
+        "source 4",
+        "source 5",
         "input 2",
         "input 3",
     ]
 
 
-def test_pdfpages_time_based_replace_can_use_from_run(tmp_path: Path) -> None:
+def test_pdfpages_mixed_source_replace_can_use_from_run(tmp_path: Path) -> None:
     run_dir = tmp_path / "runs" / "slide-002"
     input_pdf = run_dir / "pdf" / "slides.pdf"
     output_pdf = tmp_path / "slides_out.pdf"
 
-    _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 4)])
+    _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 6)])
     _make_run_context(run_dir, [f"source {idx}" for idx in range(1, 5)], [0.0, 1.0, 2.0, 3.0])
 
     exit_code = main([
         str(input_pdf),
         "--replace",
-        "2:@1.2",
+        "2,4=1,@1.2",
         "-o",
         str(output_pdf),
         "--from-run",
@@ -216,7 +219,85 @@ def test_pdfpages_time_based_replace_can_use_from_run(tmp_path: Path) -> None:
     ])
 
     assert exit_code == 0
-    assert _read_pdf_texts(output_pdf) == ["input 1", "source 2", "input 3"]
+    assert _read_pdf_texts(output_pdf) == ["input 1", "source 1", "input 3", "source 2", "input 5"]
+
+
+def test_pdfpages_legacy_colon_replace_still_uses_input_pdf_context(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "slide-005"
+    input_pdf = run_dir / "pdf" / "slides.pdf"
+    output_pdf = tmp_path / "slides_out.pdf"
+
+    _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 6)])
+    _make_run_context(run_dir, [f"source {idx}" for idx in range(1, 5)], [0.0, 1.0, 2.0, 3.0])
+
+    exit_code = main([
+        str(input_pdf),
+        "--replace",
+        "2,4:1,@1.2",
+        "-o",
+        str(output_pdf),
+    ])
+
+    assert exit_code == 0
+    assert _read_pdf_texts(output_pdf) == ["input 1", "source 1", "input 3", "source 2", "input 5"]
+
+
+def test_pdfpages_rejects_replace_length_mismatch(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "slide-004"
+    input_pdf = tmp_path / "slides.pdf"
+    output_pdf = tmp_path / "slides_out.pdf"
+    _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 5)])
+    _make_run_context(run_dir, [f"source {idx}" for idx in range(1, 5)], [0.0, 1.0, 2.0, 3.0])
+
+    try:
+        main([
+            str(input_pdf),
+            "--replace",
+            "2=1,@1.2",
+            "-o",
+            str(output_pdf),
+            "--from-run",
+            str(run_dir),
+        ])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected replace length mismatch to fail")
+
+
+def test_pdfpages_mixed_source_specs_work_in_combined_commands(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "slide-003"
+    input_pdf = run_dir / "pdf" / "slides.pdf"
+    output_pdf = tmp_path / "slides_out.pdf"
+
+    _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 7)])
+    _make_run_context(run_dir, [f"source {idx}" for idx in range(1, 6)], [0.0, 1.0, 2.0, 3.0, 4.0])
+
+    exit_code = main([
+        str(input_pdf),
+        "--insert",
+        "2,@1.2",
+        "--after",
+        "1",
+        "--replace",
+        "3,5=1,@1.2",
+        "-o",
+        str(output_pdf),
+        "--from-run",
+        str(run_dir),
+    ])
+
+    assert exit_code == 0
+    assert _read_pdf_texts(output_pdf) == [
+        "input 1",
+        "source 2",
+        "source 2",
+        "input 2",
+        "source 1",
+        "input 4",
+        "source 2",
+        "input 6",
+    ]
 
 
 def test_pdfpages_combined_operations_use_original_page_numbers(tmp_path: Path) -> None:
@@ -235,7 +316,7 @@ def test_pdfpages_combined_operations_use_original_page_numbers(tmp_path: Path) 
         "--after",
         "3",
         "--replace",
-        "4:4",
+        "4=4",
         "-o",
         str(output_pdf),
         "--from",
@@ -265,7 +346,7 @@ def test_pdfpages_rejects_delete_replace_overlap(tmp_path: Path) -> None:
             "--delete",
             "3",
             "--replace",
-            "3:1",
+            "3=1",
             "-o",
             str(output_pdf),
             "--from",

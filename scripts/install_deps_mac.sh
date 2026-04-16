@@ -41,6 +41,11 @@ if need_tool ffmpeg; then
   missing=1
 fi
 
+if need_tool tesseract; then
+  run_cmd brew install tesseract
+  missing=1
+fi
+
 if [[ "$missing" -eq 0 ]]; then
   echo "All required tools already present"
 fi
@@ -51,4 +56,7 @@ if command -v yt-dlp >/dev/null 2>&1; then
 fi
 if command -v ffmpeg >/dev/null 2>&1; then
   ffmpeg -version | head -n 1 || true
+fi
+if command -v tesseract >/dev/null 2>&1; then
+  tesseract --version | head -n 1 || true
 fi

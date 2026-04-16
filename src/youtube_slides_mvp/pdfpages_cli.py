@@ -5,7 +5,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from .pdfpages import edit_pdf_pages
+from .pdfpages import _split_replace_spec, edit_pdf_pages
 
 
 def _consume_value(tokens: Sequence[str], index: int, option_name: str) -> str:
@@ -75,9 +75,10 @@ def _parse_edit_tokens(tokens: Sequence[str]) -> tuple[str | None, list[tuple[st
 def _uses_time_source_specs(insert_ops: list[tuple[str, int]], replace_spec: str | None) -> bool:
     if any("@" in insert_spec for insert_spec, _ in insert_ops):
         return True
-    if replace_spec is None or ":" not in replace_spec:
+    if replace_spec is None:
         return False
-    return "@" in replace_spec.split(":", 1)[1]
+    _, _, source_spec = _split_replace_spec(replace_spec)
+    return "@" in source_spec
 
 
 def _load_source_rows(index_path: Path) -> list[dict[str, int | float | str]]:
@@ -157,16 +158,17 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pdfpages",
         description=(
             "Flexible PDF page editing: delete, insert, and replace can be combined in a single command. "
-            "Page specs stay numeric, and source specs may also use @timestamp syntax to reference source pages by video time. "
-            "All target page numbers and insert positions are interpreted against the original input PDF (not renumbered after edits).\n\n"
+            "Page specs stay numeric, and source specs may mix page tokens with @timestamp tokens to reference source pages by video time. "
+            "All target page numbers and insert positions are interpreted against the original input PDF (not renumbered after edits). "
+            "Replace specs use TARGET=SOURCE so they can be passed without shell quotes, and both sides must expand to the same number of pages.\n\n"
             "Multiple --insert operations are supported: each --insert <pages> must be immediately followed by --after <N>. "
             "When time-based source specs are used, the CLI can load the source PDF and its index from --from-run or by walking up from the input PDF directory."
         ),
         epilog=(
             "\nExamples:\n"
-            "  pdfpages runs/<task>/pdf/slides.pdf --insert @00:12:34-@00:12:50 --after 17 -o out.pdf\n"
-            "  pdfpages input.pdf --replace 12:@754.5s -o out.pdf --from-run runs/<task>\n"
-            "  pdfpages input.pdf --delete 2,5-8 --insert 5,7-9 --after 3 --replace 3,7:4,8 -o out.pdf --from slides_raw.pdf\n"
+            "  pdfpages runs/<task>/pdf/slides.pdf --insert 2,@00:12:34,4-5 --after 17 -o out.pdf\n"
+            "  pdfpages input.pdf --replace 12,13=4,@754.5s -o out.pdf --from-run runs/<task>\n"
+            "  pdfpages input.pdf --delete 2,5-8 --insert 5,@00:12:34,7-9 --after 3 --replace 3,7=4,8 -o out.pdf --from slides_raw.pdf\n"
             "\nTime syntax examples:\n"
             "  @754.5s\n"
             "  @12:34\n"

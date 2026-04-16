@@ -5,7 +5,7 @@ import sys
 from typing import List, Tuple
 
 # ====================== 配置 ======================
-tolerance = 5.0  # 秒
+tolerance = 3.0  # 秒
 baseline_path = 'benchmarks/slide-20260410-122639/expected_pages.json'
 run = sys.argv[1] if len(sys.argv) > 1 else 'runs/slide-v3-full-progressive'
 run_path = f'{run}/artifacts/slides.json'
