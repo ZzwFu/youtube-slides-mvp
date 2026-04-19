@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from collections.abc import Sequence
 from pathlib import Path
 
 from .pdfpages import _split_replace_spec, edit_pdf_pages
+
+
+def _configure_logging(verbose: bool, debug: bool) -> None:
+    if not verbose and not debug:
+        return
+
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
 
 def _consume_value(tokens: Sequence[str], index: int, option_name: str) -> str:
@@ -160,7 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Flexible PDF page editing: delete, insert, and replace can be combined in a single command. "
             "Page specs stay numeric, and source specs may mix page tokens with @timestamp tokens to reference source pages by video time. "
             "All target page numbers and insert positions are interpreted against the original input PDF (not renumbered after edits). "
-            "Replace specs use TARGET=SOURCE so they can be passed without shell quotes, and both sides must expand to the same number of pages.\n\n"
+            "Replace specs use TARGET=SOURCE so they can be passed without shell quotes, and both sides must expand to the same number of pages. "
+            "Use --dry-run to validate and preview output page count without writing a file.\n\n"
             "Multiple --insert operations are supported: each --insert <pages> must be immediately followed by --after <N>. "
             "When time-based source specs are used, the CLI can load the source PDF and its index from --from-run or by walking up from the input PDF directory."
         ),
@@ -174,7 +184,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  @12:34\n"
             "  @01:02:03.500\n"
             "  @12:34-@12:50\n"
-            "\nIf --from-run is omitted, the CLI looks for a run layout in the input PDF's parent directories."
+            "\nIf --from-run is omitted, the CLI looks for a run layout in the input PDF's parent directories.\n"
+            "Use --verbose (or --debug) for planning/execution logs."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -193,12 +204,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="run directory (for example runs/<task>) used to auto-locate the source PDF and time index",
     )
     parser.add_argument("-o", "--output", required=True, type=Path, help="output PDF path")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and plan edits without writing the output PDF",
+    )
+    parser.add_argument("--verbose", action="store_true", help="print summary logs")
+    parser.add_argument("--debug", action="store_true", help="print detailed planning logs")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args, edit_tokens = parser.parse_known_args(argv)
+    _configure_logging(args.verbose, args.debug)
 
     try:
         if not edit_tokens:
@@ -221,7 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 parser.error("--from is required with --insert or --replace")
 
-        edit_pdf_pages(
+        output_pages = edit_pdf_pages(
             args.input_pdf,
             args.output,
             source_pdf=source_pdf,
@@ -229,7 +248,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             delete_spec=delete_spec,
             insert_ops=insert_ops,
             replace_spec=replace_spec,
+            dry_run=args.dry_run,
         )
+
+        if args.dry_run:
+            print(f"[DRY-RUN] planned output page count: {output_pages}")
         return 0
     except ValueError as exc:
         parser.error(str(exc))

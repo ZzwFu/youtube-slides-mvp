@@ -5,17 +5,29 @@ from pathlib import Path
 import fitz
 
 from src.youtube_slides_mvp.extract import write_frame_manifest
-from src.youtube_slides_mvp.pdfpages import expand_page_spec
+from src.youtube_slides_mvp.pdfpages import build_edit_plan, expand_page_spec
 from src.youtube_slides_mvp.pdfpages_cli import main
 
 
-def _make_pdf(path: Path, labels: list[str]) -> None:
+def _make_pdf(
+    path: Path,
+    labels: list[str],
+    *,
+    toc: list[list[int | str]] | None = None,
+    metadata: dict[str, str] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     doc = fitz.open()
     try:
         for label in labels:
             page = doc.new_page(width=300, height=200)
             page.insert_text((24, 96), label, fontsize=18)
+
+        if toc:
+            doc.set_toc(toc)
+        if metadata:
+            doc.set_metadata(metadata)
+
         doc.save(str(path))
     finally:
         doc.close()
@@ -59,6 +71,22 @@ def test_expand_page_spec_supports_flexible_ranges() -> None:
     assert expand_page_spec("1,3-5,8-", 10) == [1, 3, 4, 5, 8, 9, 10]
     assert expand_page_spec("last", 10) == [10]
     assert expand_page_spec("-1", 10) == [10]
+
+
+def test_build_edit_plan_stays_in_original_page_coordinates() -> None:
+    plan = build_edit_plan(
+        input_page_count=6,
+        source_page_count=8,
+        source_rows=None,
+        delete_spec="2,5",
+        insert_ops=[("3,4", 1), ("6", 4)],
+        replace_spec="3,6=1,8",
+    )
+
+    assert plan.delete_pages == {2, 5}
+    assert plan.replacement_map == {3: 1, 6: 8}
+    assert plan.insert_groups == {1: [[3, 4]], 4: [[6]]}
+    assert plan.output_page_count == 7
 
 
 def test_pdfpages_delete(tmp_path: Path) -> None:
@@ -356,3 +384,59 @@ def test_pdfpages_rejects_delete_replace_overlap(tmp_path: Path) -> None:
         assert exc.code == 2
     else:
         raise AssertionError("expected combined delete/replace conflict to fail")
+
+
+def test_pdfpages_dry_run_prints_plan_and_skips_output_write(tmp_path: Path, capsys) -> None:
+    input_pdf = tmp_path / "slides.pdf"
+    source_pdf = tmp_path / "slides_raw.pdf"
+    output_pdf = tmp_path / "slides_out.pdf"
+    _make_pdf(input_pdf, [f"input {idx}" for idx in range(1, 5)])
+    _make_pdf(source_pdf, [f"source {idx}" for idx in range(1, 5)])
+
+    exit_code = main([
+        str(input_pdf),
+        "--delete",
+        "2",
+        "--insert",
+        "1,2",
+        "--after",
+        "1",
+        "-o",
+        str(output_pdf),
+        "--from",
+        str(source_pdf),
+        "--dry-run",
+    ])
+
+    assert exit_code == 0
+    assert not output_pdf.exists()
+    assert "planned output page count: 5" in capsys.readouterr().out
+
+
+def test_pdfpages_preserves_metadata_and_remaps_toc_after_delete(tmp_path: Path) -> None:
+    input_pdf = tmp_path / "slides.pdf"
+    output_pdf = tmp_path / "slides_out.pdf"
+
+    _make_pdf(
+        input_pdf,
+        [f"input {idx}" for idx in range(1, 4)],
+        toc=[[1, "Intro", 1], [1, "Conclusion", 3]],
+        metadata={"title": "Demo Deck", "author": "qa"},
+    )
+
+    exit_code = main([
+        str(input_pdf),
+        "--delete",
+        "2",
+        "-o",
+        str(output_pdf),
+    ])
+
+    assert exit_code == 0
+
+    doc = fitz.open(str(output_pdf))
+    try:
+        assert doc.metadata.get("title") == "Demo Deck"
+        assert doc.get_toc(simple=True) == [[1, "Intro", 1], [1, "Conclusion", 2]]
+    finally:
+        doc.close()

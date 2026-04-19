@@ -20,6 +20,62 @@ Day 1 implementation scaffold for extracting webinar slides into PDF artifacts.
 - Docker image with required system tools (`yt-dlp`, `ffmpeg`, `python3`)
 - Healthcheck command printing dependency versions
 
+
+## 安装与环境准备
+
+### 1. 安装系统依赖
+
+#### macOS
+在项目根目录下运行：
+```bash
+bash scripts/install_deps_mac.sh
+```
+如需预览将安装哪些依赖，可加 `--dry-run`。
+
+#### Linux (以 Ubuntu/Debian 为例)
+需手动安装依赖：
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip ffmpeg tesseract-ocr
+pip3 install -r requirements.txt
+```
+如需 `yt-dlp`，可用：
+```bash
+pip3 install yt-dlp
+# 或
+sudo apt install yt-dlp
+```
+
+### 2. 安装 Python 依赖
+
+建议使用虚拟环境：
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+然后安装依赖：
+```bash
+pip install -r requirements.txt
+```
+
+### 3. 健康检查
+
+```bash
+make health
+# 或
+python -m youtube_slides_mvp.cli healthcheck
+```
+
+### 4. 快速验证
+
+```bash
+make smoke
+# 或
+make run URL="https://www.youtube.com/watch?v=..." OUTDIR="./runs"
+```
+
+---
+
 ## Quick start
 
 ```bash
@@ -102,6 +158,7 @@ pdfpages slides.pdf --delete 2,5-8,12 --insert 5,7-9,13 --after 3 --replace 3,7=
 pdfpages slides.pdf --insert 2 --after 1 --insert 4-5 --after 3 -o slides-1.pdf --from slides_raw.pdf
 pdfpages slides.pdf --insert 2,@00:12:34,4-5 --after 17 -o slides-1.pdf --from-run runs/<task>
 pdfpages slides.pdf --replace 12,13=4,@754.5s -o slides-1.pdf --from-run runs/<task>
+pdfpages slides.pdf --delete 2 --insert 4-5 --after 3 --replace 7=8 -o out.pdf --from slides_raw.pdf --dry-run --verbose
 ```
 
 如未安装到全局，可用如下方式临时调用：
@@ -112,6 +169,8 @@ PYTHONPATH=src python -m youtube_slides_mvp.pdfpages_cli slides.pdf --delete 2,5
 
 `--insert` 可以重复出现，每一条都必须紧跟一个 `--after`，例如 `--insert 2 --after 1 --insert 4-5 --after 3`。
 `--insert` 和 `--replace` 的 source 侧现在也支持 `@时间` 语法，并且可以和页码 token 混写，例如 `2,@00:12:34,4-5` 或 `1,@754.5s`。`--replace` 使用 `TARGET=SOURCE`，因此不需要额外引号；例如 `12,13=4,@754.5s`。两边展开后的页数必须一致。`--from-run` 可以直接给 `runs/<task>/` 目录，CLI 会自动找到源 PDF 和时间索引；如果不传 `--from-run`，它会从当前 input PDF 所在目录向上查找同样的 run 上下文。
+`pdfpages` 采用“先构建编辑计划，再执行渲染”的模型：所有页码都先按原始输入 PDF 解析，再一次性写出结果。写文件时使用临时文件替换（原子写入），减少中断时输出损坏风险。
+默认会尽最大努力保留输入 PDF 的 metadata 与 TOC（书签）：指向被删除页的 TOC 条目会被移除，其余条目会重映射到新页码。可通过 `--verbose` 或 `--debug` 查看计划与执行日志。
 
 ### Range syntax
 
@@ -147,8 +206,8 @@ Each run creates:
 
 ## Evaluation
 
-```bash
-# First-time setup: promote a manually approved run into a reusable benchmark:
+`pdfpages` 采用“先构建编辑计划，再执行渲染”的模型：所有页码都先按原始输入 PDF 解析，再一次性写出结果。写文件时使用临时文件替换（原子写入），减少中断时输出损坏风险。
+默认会尽最大努力保留输入 PDF 的 metadata 与 TOC（书签）：指向被删除页的 TOC 条目会被移除，其余条目会重映射到新页码。可通过 `--verbose` 或 `--debug` 查看计划与执行日志。
 python scripts/create_benchmark.py slide-20260409-022438 slide-20260409-022438
 
 # Compare a run against the approved benchmark:

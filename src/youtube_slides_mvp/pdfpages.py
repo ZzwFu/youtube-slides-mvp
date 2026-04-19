@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from dataclasses import dataclass
+import logging
 import re
 from collections.abc import Sequence
 from pathlib import Path
@@ -8,6 +10,8 @@ from pathlib import Path
 import fitz
 
 __all__ = [
+    "EditPlan",
+    "build_edit_plan",
     "expand_page_spec",
     "edit_pdf_pages",
     "delete_pdf_pages",
@@ -17,6 +21,25 @@ __all__ = [
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _TIME_UNIT_RE = re.compile(r"^(?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>\d+(?:\.\d+)?)s?)?$")
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class EditPlan:
+    """Normalized editing plan in original input-page coordinates."""
+
+    input_page_count: int
+    delete_pages: set[int]
+    replacement_map: dict[int, int]
+    insert_groups: dict[int, list[list[int]]]
+
+    @property
+    def inserted_page_count(self) -> int:
+        return sum(len(group) for groups in self.insert_groups.values() for group in groups)
+
+    @property
+    def output_page_count(self) -> int:
+        return self.input_page_count - len(self.delete_pages) + self.inserted_page_count
 
 
 def _normalize_page_spec(spec: str) -> str:
@@ -227,7 +250,7 @@ def _expand_time_token(
 
     if raw_token.endswith("-") and raw_token != "-":
         start_token = raw_token[:-1]
-        if not start_token.startswith("@"): 
+        if not start_token.startswith("@"):
             raise ValueError("time-based source specs must use @ timestamps")
         start_time = _parse_time_seconds(start_token)
         start_index = _time_index_for_timestamp(start_time, timestamps)
@@ -235,7 +258,7 @@ def _expand_time_token(
 
     if raw_token.count("-") == 1:
         left, right = raw_token.split("-", 1)
-        if not left.startswith("@") or not right.startswith("@"): 
+        if not left.startswith("@") or not right.startswith("@"):
             raise ValueError("time-based source specs must use @ timestamps")
         start_time = _parse_time_seconds(left)
         end_time = _parse_time_seconds(right)
@@ -245,7 +268,7 @@ def _expand_time_token(
         end_index = _time_index_for_timestamp(end_time, timestamps)
         return list(page_numbers[start_index : end_index + 1])
 
-    if not raw_token.startswith("@"): 
+    if not raw_token.startswith("@"):
         raise ValueError("time-based source specs must use @ timestamps")
 
     point_time = _parse_time_seconds(raw_token)
@@ -292,7 +315,13 @@ def _open_pdf(path: Path) -> fitz.Document:
 
 def _append_pages(out_doc: fitz.Document, src_doc: fitz.Document, page_numbers: list[int]) -> None:
     for page_number in page_numbers:
-        out_doc.insert_pdf(src_doc, from_page=page_number - 1, to_page=page_number - 1)
+        out_doc.insert_pdf(
+            src_doc,
+            from_page=page_number - 1,
+            to_page=page_number - 1,
+            links=True,
+            annots=True,
+        )
 
 
 def _save_document(doc: fitz.Document, out_pdf: Path) -> None:
@@ -325,6 +354,176 @@ def _parse_replace_spec(
     return dict(zip(target_pages, source_pages))
 
 
+def build_edit_plan(
+    *,
+    input_page_count: int,
+    source_page_count: int | None,
+    source_rows: Sequence[dict[str, int | float | str]] | None,
+    delete_spec: str | None,
+    insert_ops: list[tuple[str, int]] | None,
+    replace_spec: str | None,
+) -> EditPlan:
+    """Build and validate an immutable edit plan before any PDF output is written."""
+    delete_pages: set[int] = set()
+    if delete_spec is not None:
+        delete_pages = set(expand_page_spec(delete_spec, input_page_count))
+
+    replacement_map: dict[int, int] = {}
+    if replace_spec is not None:
+        if source_page_count is None:
+            raise ValueError("--from is required with --replace")
+        replacement_map = _parse_replace_spec(
+            replace_spec,
+            input_page_count,
+            source_page_count,
+            source_rows,
+        )
+
+    insert_groups: dict[int, list[list[int]]] = {}
+    if insert_ops:
+        if source_page_count is None:
+            raise ValueError("--from is required with --insert")
+
+        for insert_spec, after in insert_ops:
+            if after < 0:
+                raise ValueError("--after must be >= 0")
+            if after > input_page_count:
+                raise ValueError(f"--after {after} exceeds input document length {input_page_count}")
+            insert_pages = _expand_source_spec(insert_spec, source_page_count, source_rows)
+            insert_groups.setdefault(after, []).append(insert_pages)
+
+    overlap = sorted(delete_pages & replacement_map.keys())
+    if overlap:
+        overlap_text = ", ".join(str(page) for page in overlap)
+        raise ValueError(f"--delete and --replace target the same page(s): {overlap_text}")
+
+    return EditPlan(
+        input_page_count=input_page_count,
+        delete_pages=delete_pages,
+        replacement_map=replacement_map,
+        insert_groups=insert_groups,
+    )
+
+
+def _copy_document_metadata(input_doc: fitz.Document, out_doc: fitz.Document) -> None:
+    try:
+        metadata = input_doc.metadata or {}
+        cleaned = {key: value for key, value in metadata.items() if isinstance(value, str)}
+        if cleaned:
+            out_doc.set_metadata(cleaned)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Unable to preserve PDF metadata: %s", exc)
+
+
+def _build_original_to_output_page_map(plan: EditPlan) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    output_page = 1
+
+    for insert_pages in plan.insert_groups.get(0, []):
+        output_page += len(insert_pages)
+
+    for page_number in range(1, plan.input_page_count + 1):
+        if page_number not in plan.delete_pages:
+            mapping[page_number] = output_page
+            output_page += 1
+
+        for insert_pages in plan.insert_groups.get(page_number, []):
+            output_page += len(insert_pages)
+
+    return mapping
+
+
+def _normalize_toc_levels(entries: list[list[int | str]]) -> list[list[int | str]]:
+    normalized: list[list[int | str]] = []
+    previous_level = 1
+
+    for index, entry in enumerate(entries):
+        level = int(entry[0])
+        title = str(entry[1])
+        page = int(entry[2])
+
+        level = max(1, level)
+        if index == 0:
+            level = 1
+        elif level > previous_level + 1:
+            level = previous_level + 1
+
+        normalized.append([level, title, page])
+        previous_level = level
+
+    return normalized
+
+
+def _copy_toc_with_page_remap(input_doc: fitz.Document, out_doc: fitz.Document, plan: EditPlan) -> None:
+    try:
+        toc = input_doc.get_toc(simple=True)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Unable to read input TOC: %s", exc)
+        return
+
+    if not toc:
+        return
+
+    page_map = _build_original_to_output_page_map(plan)
+    remapped: list[list[int | str]] = []
+    for row in toc:
+        if len(row) < 3:
+            continue
+
+        level, title, original_page = row[:3]
+        mapped_page = page_map.get(int(original_page))
+        if mapped_page is None:
+            continue
+        remapped.append([int(level), str(title), mapped_page])
+
+    if not remapped:
+        LOGGER.info("TOC entries were dropped because their target pages were deleted")
+        return
+
+    try:
+        out_doc.set_toc(_normalize_toc_levels(remapped))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Unable to set remapped TOC in output PDF: %s", exc)
+
+
+def _apply_edit_plan(
+    out_doc: fitz.Document,
+    input_doc: fitz.Document,
+    source_doc: fitz.Document | None,
+    plan: EditPlan,
+) -> None:
+    if 0 in plan.insert_groups:
+        assert source_doc is not None
+        for insert_pages in plan.insert_groups[0]:
+            _append_pages(out_doc, source_doc, insert_pages)
+
+    for page_number in range(1, plan.input_page_count + 1):
+        if page_number not in plan.delete_pages:
+            source_page = plan.replacement_map.get(page_number)
+            if source_page is None:
+                out_doc.insert_pdf(
+                    input_doc,
+                    from_page=page_number - 1,
+                    to_page=page_number - 1,
+                    links=True,
+                    annots=True,
+                )
+            else:
+                assert source_doc is not None
+                out_doc.insert_pdf(
+                    source_doc,
+                    from_page=source_page - 1,
+                    to_page=source_page - 1,
+                    links=True,
+                    annots=True,
+                )
+
+        if page_number in plan.insert_groups:
+            assert source_doc is not None
+            for insert_pages in plan.insert_groups[page_number]:
+                _append_pages(out_doc, source_doc, insert_pages)
+
+
 def edit_pdf_pages(
     input_pdf: Path,
     output_pdf: Path,
@@ -334,71 +533,54 @@ def edit_pdf_pages(
     delete_spec: str | None = None,
     insert_ops: list[tuple[str, int]] | None = None,
     replace_spec: str | None = None,
+    dry_run: bool = False,
+    preserve_metadata: bool = True,
+    preserve_toc: bool = True,
 ) -> int:
     input_doc = _open_pdf(input_pdf)
     source_doc: fitz.Document | None = None
     try:
         input_page_count = input_doc.page_count
 
-        delete_pages: set[int] = set()
-        if delete_spec is not None:
-            delete_pages = set(expand_page_spec(delete_spec, input_page_count))
-
-        replacement_map: dict[int, int] = {}
-        if replace_spec is not None:
+        source_page_count: int | None = None
+        requires_source = bool(insert_ops) or replace_spec is not None
+        if requires_source:
             if source_pdf is None:
-                raise ValueError("--from is required with --replace")
+                raise ValueError("--from is required with --insert or --replace")
             source_doc = _open_pdf(source_pdf)
-            if source_rows is not None and source_doc.page_count != len(source_rows):
+            source_page_count = source_doc.page_count
+            if source_rows is not None and source_page_count != len(source_rows):
                 raise ValueError("source index length does not match source PDF page count")
-            replacement_map = _parse_replace_spec(
-                replace_spec,
-                input_page_count,
-                source_doc.page_count,
-                source_rows,
-            )
 
-        insert_groups: dict[int, list[list[int]]] = {}
-        if insert_ops:
-            if source_pdf is None:
-                raise ValueError("--from is required with --insert")
-            if source_doc is None:
-                source_doc = _open_pdf(source_pdf)
-            if source_rows is not None and source_doc.page_count != len(source_rows):
-                raise ValueError("source index length does not match source PDF page count")
-            for insert_spec, after in insert_ops:
-                if after < 0:
-                    raise ValueError("--after must be >= 0")
-                if after > input_page_count:
-                    raise ValueError(f"--after {after} exceeds input document length {input_page_count}")
-                insert_pages = _expand_source_spec(insert_spec, source_doc.page_count, source_rows)
-                insert_groups.setdefault(after, []).append(insert_pages)
+        plan = build_edit_plan(
+            input_page_count=input_page_count,
+            source_page_count=source_page_count,
+            source_rows=source_rows,
+            delete_spec=delete_spec,
+            insert_ops=insert_ops,
+            replace_spec=replace_spec,
+        )
 
-        overlap = sorted(delete_pages & replacement_map.keys())
-        if overlap:
-            overlap_text = ", ".join(str(page) for page in overlap)
-            raise ValueError(f"--delete and --replace target the same page(s): {overlap_text}")
+        LOGGER.debug(
+            "Built edit plan: input_pages=%s delete=%s replace=%s insert_groups=%s output_pages=%s",
+            plan.input_page_count,
+            len(plan.delete_pages),
+            len(plan.replacement_map),
+            len(plan.insert_groups),
+            plan.output_page_count,
+        )
+
+        if dry_run:
+            return plan.output_page_count
 
         out_doc = fitz.open()
         try:
-            if 0 in insert_groups:
-                assert source_doc is not None
-                for insert_pages in insert_groups[0]:
-                    _append_pages(out_doc, source_doc, insert_pages)
+            _apply_edit_plan(out_doc, input_doc, source_doc, plan)
 
-            for page_number in range(1, input_page_count + 1):
-                if page_number not in delete_pages:
-                    source_page = replacement_map.get(page_number)
-                    if source_page is None:
-                        out_doc.insert_pdf(input_doc, from_page=page_number - 1, to_page=page_number - 1)
-                    else:
-                        assert source_doc is not None
-                        out_doc.insert_pdf(source_doc, from_page=source_page - 1, to_page=source_page - 1)
-
-                if page_number in insert_groups:
-                    assert source_doc is not None
-                    for insert_pages in insert_groups[page_number]:
-                        _append_pages(out_doc, source_doc, insert_pages)
+            if preserve_metadata:
+                _copy_document_metadata(input_doc, out_doc)
+            if preserve_toc:
+                _copy_toc_with_page_remap(input_doc, out_doc, plan)
 
             out_pages = out_doc.page_count
             _save_document(out_doc, output_pdf)
