@@ -1,6 +1,6 @@
 """
 Reuse extracted frames from a previous run and execute D3-D10 directly.
-Usage: python scripts/rerun_d3_d10.py [source_run_id] [complete_mode] [gap_refill_mode=confidence]
+Usage: python scripts/rerun_d3_d10.py [source_run_id_or_path] [complete_mode] [gap_refill_mode=confidence]
 """
 from __future__ import annotations
 
@@ -27,6 +27,16 @@ RUNS_DIR = Path(__file__).parent.parent / "runs"
 URL = "http://youtube.com/watch?v=9eqDWJSvCx4"
 
 
+def _resolve_source_run(source_arg: str) -> tuple[str, Path]:
+    candidate = Path(source_arg)
+    if candidate.exists() and candidate.is_dir():
+        src_run = candidate.resolve()
+        return src_run.name, src_run
+
+    src_run = RUNS_DIR / source_arg
+    return source_arg, src_run
+
+
 def _source_url_for_run(src_run: Path) -> str:
     manifest_path = src_run / "manifest.json"
     if not manifest_path.exists():
@@ -42,7 +52,7 @@ def _source_url_for_run(src_run: Path) -> str:
 
 
 def main() -> int:
-    src_id = sys.argv[1] if len(sys.argv) > 1 else "slide-20260408-034253"
+    source_arg = sys.argv[1] if len(sys.argv) > 1 else "slide-20260408-034253"
     complete_mode = sys.argv[2] if len(sys.argv) > 2 else "iterative"
     gap_refill_mode = "confidence"
     if len(sys.argv) > 3:
@@ -53,7 +63,7 @@ def main() -> int:
     if gap_refill_mode != "confidence":
         print(f"ERROR: gap_refill_mode only supports confidence, got: {gap_refill_mode}")
         return 2
-    src_run = RUNS_DIR / src_id
+    src_id, src_run = _resolve_source_run(source_arg)
     src_frames = src_run / "frames_raw"
     src_manifest = src_run / "artifacts" / "frame_manifest.json"
 
@@ -65,6 +75,7 @@ def main() -> int:
         return 1
 
     source_url = _source_url_for_run(src_run)
+    print(f"Reusing source run: {src_run} (no download)")
 
     tid = make_task_id("slide")
     paths = build_task_paths(RUNS_DIR, tid)
@@ -83,7 +94,12 @@ def main() -> int:
 
     fps = 1.0
     manifest = TaskManifest(task_id=tid, url=source_url, outdir=str(RUNS_DIR), task_dir=str(paths.task_dir))
-    manifest.metadata["download"] = {"mode": "reuse-frames", "src_run": src_id, "source_url": source_url, "ok": True}
+    manifest.metadata["download"] = {
+        "mode": "reuse-frames-no-download",
+        "src_run": src_id,
+        "source_url": source_url,
+        "ok": True,
+    }
     manifest.metadata["extract"] = {"ok": True, "fps": fps, "frame_count": n_frames}
 
     # ── D3 Preprocess ────────────────────────────────────────────────────────
