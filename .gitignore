@@ -1,10 +1,77 @@
+# === OpenClaw/project related ===
 runs/
-__pycache__/
-*.pyc
-.venv/
+benchmarks/
 *DebugHistory*
 *project*history*
 benchmark*
-.DS_Store
+
+# === Python cache/compiled files ===
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+
+# === Virtualenv/dependencies ===
+.venv/
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# === Logs/temp files ===
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# === Unit test/coverage ===
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# === Jupyter Notebook ===
+.ipynb_checkpoints
+
+# === pyenv ===
+.python-version
+
+# === mypy ===
+.mypy_cache/
+.dmypy.json
+
+# === IDE/editor ===
 .vscode/
-benchmarks/
+.idea/
+
+# === macOS/Windows system files ===
+.DS_Store
+Thumbs.db
+
+# === Images/PDF (repo root only, not subdirs) ===
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.bmp
+/*.tiff
+/*.pdf
